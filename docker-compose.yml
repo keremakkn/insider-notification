@@ -1,0 +1,45 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: notifier
+      POSTGRES_PASSWORD: notifier
+      POSTGRES_DB: notifier
+    ports: ["5432:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U notifier"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build: .
+    entrypoint: ["/usr/local/bin/api"]
+    env_file: [{ path: .env, required: false }]
+    environment: &app-env
+      DATABASE_URL: postgres://notifier:notifier@postgres:5432/notifier?sslmode=disable
+      REDIS_ADDR: redis:6379
+    ports: ["8080:8080"]
+    depends_on: &app-deps
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+  worker:
+    build: .
+    entrypoint: ["/usr/local/bin/worker"]
+    env_file: [{ path: .env, required: false }]
+    environment: *app-env
+    depends_on: *app-deps
+
+volumes:
+  pgdata:

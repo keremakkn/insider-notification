@@ -16,6 +16,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/keremakkn/insider-notification/internal/domain"
+	"github.com/keremakkn/insider-notification/internal/service"
 )
 
 // Service is what the handlers need. Declared here so tests can fake it if needed.
@@ -24,11 +25,14 @@ type Service interface {
 	Get(ctx context.Context, id uuid.UUID) (domain.Notification, error)
 	Cancel(ctx context.Context, id uuid.UUID) (domain.Notification, error)
 	List(ctx context.Context, f domain.ListFilter) ([]domain.Notification, *domain.Cursor, error)
+	CreateBatch(ctx context.Context, reqs []domain.CreateRequest, correlationID string) (service.BatchResult, error)
+	GetBatch(ctx context.Context, id uuid.UUID) (domain.BatchSummary, error)
 }
 
 const (
 	IdempotencyHeader = "Idempotency-Key"
-	maxBodyBytes      = 1 << 20 // 1 MiB: a 100 KB email plus JSON overhead fits easily
+	maxBodyBytes      = 1 << 20  // 1 MiB: a 100 KB email plus JSON overhead fits easily
+	maxBatchBodyBytes = 32 << 20 // 32 MiB: 1000 items; very large emails belong in smaller batches
 )
 
 type handlers struct {
@@ -44,17 +48,19 @@ func NewRouter(svc Service, log *slog.Logger) http.Handler {
 
 	r.Route("/api/v1/notifications", func(r chi.Router) {
 		r.Post("/", h.create)
+		r.Post("/batch", h.createBatch)
 		r.Get("/", h.list)
 		r.Get("/{id}", h.get)
 		r.Post("/{id}/cancel", h.cancel)
 	})
+	r.Get("/api/v1/batches/{id}", h.getBatch)
 	return r
 }
 
 // create answers 202 for a new notification and 200 for an idempotent replay.
 func (h *handlers) create(w http.ResponseWriter, r *http.Request) {
 	var body createRequest
-	if !h.decode(w, r, &body) {
+	if !h.decode(w, r, &body, maxBodyBytes) {
 		return
 	}
 	n, created, err := h.svc.Create(r.Context(), domain.CreateRequest{
@@ -123,6 +129,13 @@ func (h *handlers) list(w http.ResponseWriter, r *http.Request) {
 		}
 		f.Channel = &ch
 	}
+	if s := q.Get("batchId"); s != "" {
+		id, err := uuid.Parse(s)
+		if err != nil {
+			v.Add("batchId", "must be a UUID")
+		}
+		f.BatchID = &id
+	}
 	f.From = parseTime(q.Get("from"), "from", &v)
 	f.To = parseTime(q.Get("to"), "to", &v)
 	if s := q.Get("limit"); s != "" {
@@ -157,6 +170,71 @@ func (h *handlers) list(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// createBatch accepts valid items and reports invalid ones (202). If no item
+// is accepted, nothing is stored and the answer is 400 with every reason.
+func (h *handlers) createBatch(w http.ResponseWriter, r *http.Request) {
+	var body batchRequest
+	if !h.decode(w, r, &body, maxBatchBodyBytes) {
+		return
+	}
+	reqs := make([]domain.CreateRequest, len(body.Items))
+	for i, it := range body.Items {
+		reqs[i] = domain.CreateRequest{
+			Recipient: it.Recipient, Channel: it.Channel, Content: it.Content,
+			Priority: it.Priority, ScheduledAt: it.ScheduledAt, IdempotencyKey: it.IdempotencyKey,
+		}
+	}
+	res, err := h.svc.CreateBatch(r.Context(), reqs, CorrelationIDFrom(r.Context()))
+	if err != nil {
+		h.writeError(w, r, err, nil)
+		return
+	}
+
+	resp := batchResponse{Total: len(res.Items), Items: make([]batchItemResponse, len(res.Items))}
+	for i, it := range res.Items {
+		item := batchItemResponse{Index: it.Index}
+		var v *domain.ValidationError
+		switch {
+		case errors.As(it.Err, &v):
+			item.Error = &errorDetail{Code: "validation_failed", Message: "item is invalid", Fields: v.Fields}
+		case errors.Is(it.Err, domain.ErrIdempotencyMismatch):
+			item.Error = &errorDetail{Code: "idempotency_key_reused", Message: it.Err.Error()}
+		default:
+			item.ID = it.Notification.ID.String()
+			item.Status = string(it.Notification.Status)
+			item.Duplicate = !it.Created
+		}
+		if item.Error != nil {
+			resp.Rejected++
+		} else {
+			resp.Accepted++
+		}
+		resp.Items[i] = item
+	}
+
+	status := http.StatusAccepted
+	if res.Batch == nil {
+		status = http.StatusBadRequest
+	} else {
+		resp.BatchID = res.Batch.ID.String()
+		w.Header().Set("Location", "/api/v1/batches/"+resp.BatchID)
+	}
+	writeJSON(w, status, resp)
+}
+
+func (h *handlers) getBatch(w http.ResponseWriter, r *http.Request) {
+	id, ok := h.pathID(w, r)
+	if !ok {
+		return
+	}
+	s, err := h.svc.GetBatch(r.Context(), id)
+	if err != nil {
+		h.writeError(w, r, err, nil)
+		return
+	}
+	writeJSON(w, http.StatusOK, toBatchSummary(s))
+}
+
 func parseTime(s, field string, v *domain.ValidationError) *time.Time {
 	if s == "" {
 		return nil
@@ -179,8 +257,8 @@ func (h *handlers) pathID(w http.ResponseWriter, r *http.Request) (uuid.UUID, bo
 }
 
 // decode reads a JSON body strictly: size-limited, no unknown fields, one value.
-func (h *handlers) decode(w http.ResponseWriter, r *http.Request, dst any) bool {
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodyBytes))
+func (h *handlers) decode(w http.ResponseWriter, r *http.Request, dst any, limit int64) bool {
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, limit))
 	dec.DisallowUnknownFields()
 	err := dec.Decode(dst)
 	if err == nil && dec.Decode(&struct{}{}) != io.EOF {
@@ -189,7 +267,7 @@ func (h *handlers) decode(w http.ResponseWriter, r *http.Request, dst any) bool 
 	if err != nil {
 		var tooBig *http.MaxBytesError
 		if errors.As(err, &tooBig) {
-			writeJSON(w, http.StatusRequestEntityTooLarge, errorBody("body_too_large", fmt.Sprintf("body exceeds %d bytes", maxBodyBytes), nil))
+			writeJSON(w, http.StatusRequestEntityTooLarge, errorBody("body_too_large", fmt.Sprintf("body exceeds %d bytes", limit), nil))
 			return false
 		}
 		writeJSON(w, http.StatusBadRequest, errorBody("invalid_request", "invalid JSON: "+err.Error(), nil))
@@ -206,7 +284,7 @@ func (h *handlers) writeError(w http.ResponseWriter, r *http.Request, err error,
 	case errors.As(err, &v):
 		writeJSON(w, http.StatusBadRequest, errorBody("validation_failed", "request is invalid", v.Fields))
 	case errors.Is(err, domain.ErrNotFound):
-		writeJSON(w, http.StatusNotFound, errorBody("not_found", "notification not found", nil))
+		writeJSON(w, http.StatusNotFound, errorBody("not_found", "not found", nil))
 	case errors.Is(err, domain.ErrNotCancellable):
 		body := errorBody("not_cancellable", "only pending notifications can be cancelled", nil)
 		if current != nil {

@@ -16,6 +16,8 @@ type MemRepo struct {
 	mu    sync.Mutex
 	byID  map[uuid.UUID]domain.Notification
 	byKey map[string]uuid.UUID
+
+	batches map[uuid.UUID]domain.Batch
 }
 
 func NewMemRepo() *MemRepo {
@@ -75,7 +77,8 @@ func (m *MemRepo) List(_ context.Context, f domain.ListFilter) ([]domain.Notific
 	var all []domain.Notification
 	for _, n := range m.byID {
 		switch {
-		case f.Status != nil && n.Status != *f.Status,
+		case f.BatchID != nil && (n.BatchID == nil || *n.BatchID != *f.BatchID),
+			f.Status != nil && n.Status != *f.Status,
 			f.Channel != nil && n.Channel != *f.Channel,
 			f.From != nil && n.CreatedAt.Before(*f.From),
 			f.To != nil && !n.CreatedAt.Before(*f.To),
@@ -101,4 +104,55 @@ func before(n domain.Notification, c domain.Cursor) bool {
 		return n.CreatedAt.Before(c.CreatedAt)
 	}
 	return n.ID.String() < c.ID.String()
+}
+
+func (m *MemRepo) CreateBatch(_ context.Context, b domain.Batch, items []domain.Notification,
+	isReplay func(item, stored domain.Notification) bool) ([]domain.CreateOutcome, domain.Batch, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.batches == nil {
+		m.batches = map[uuid.UUID]domain.Batch{}
+	}
+	outcomes := make([]domain.CreateOutcome, len(items))
+	var inserted []uuid.UUID
+	for i, n := range items {
+		if id, ok := m.byKey[n.IdempotencyKey]; ok && n.IdempotencyKey != "" {
+			outcomes[i] = domain.CreateOutcome{Stored: m.byID[id]}
+			if !isReplay(n, m.byID[id]) {
+				b.Accepted--
+				b.Rejected++
+			}
+			continue
+		}
+		if n.IdempotencyKey != "" {
+			m.byKey[n.IdempotencyKey] = n.ID
+		}
+		m.byID[n.ID] = n
+		inserted = append(inserted, n.ID)
+		outcomes[i] = domain.CreateOutcome{Stored: n, Created: true}
+	}
+	if b.Accepted == 0 { // mirror the rollback of the real repository
+		for _, id := range inserted {
+			delete(m.byID, id)
+		}
+		return outcomes, domain.Batch{}, nil
+	}
+	m.batches[b.ID] = b
+	return outcomes, b, nil
+}
+
+func (m *MemRepo) GetBatch(_ context.Context, id uuid.UUID) (domain.BatchSummary, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	b, ok := m.batches[id]
+	if !ok {
+		return domain.BatchSummary{}, domain.ErrNotFound
+	}
+	s := domain.BatchSummary{Batch: b, StatusCounts: map[domain.Status]int{}}
+	for _, n := range m.byID {
+		if n.BatchID != nil && *n.BatchID == id {
+			s.StatusCounts[n.Status]++
+		}
+	}
+	return s, nil
 }

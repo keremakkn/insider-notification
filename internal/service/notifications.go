@@ -18,6 +18,9 @@ type Repository interface {
 	Get(ctx context.Context, id uuid.UUID) (domain.Notification, error)
 	Cancel(ctx context.Context, id uuid.UUID) (domain.Notification, error)
 	List(ctx context.Context, f domain.ListFilter) ([]domain.Notification, *domain.Cursor, error)
+	CreateBatch(ctx context.Context, b domain.Batch, items []domain.Notification,
+		isReplay func(item, stored domain.Notification) bool) ([]domain.CreateOutcome, domain.Batch, error)
+	GetBatch(ctx context.Context, id uuid.UUID) (domain.BatchSummary, error)
 }
 
 const (
@@ -49,7 +52,7 @@ func (s *Notifications) Create(ctx context.Context, req domain.CreateRequest, co
 	if err != nil {
 		return domain.Notification{}, false, err
 	}
-	if !created && stored.RequestHash != n.RequestHash {
+	if !created && !isReplay(n, stored) {
 		return domain.Notification{}, false, domain.ErrIdempotencyMismatch
 	}
 	return stored, created, nil
@@ -80,4 +83,85 @@ func (s *Notifications) List(ctx context.Context, f domain.ListFilter) ([]domain
 		return nil, nil, &v
 	}
 	return s.repo.List(ctx, f)
+}
+
+// isReplay is the idempotency rule: a stored notification with the same key
+// is a replay only if the request was identical.
+func isReplay(item, stored domain.Notification) bool {
+	return item.RequestHash == stored.RequestHash
+}
+
+// ItemResult is the outcome of one batch item, in request order.
+type ItemResult struct {
+	Index        int
+	Notification *domain.Notification // nil when rejected
+	Created      bool                 // false for an idempotent replay
+	Err          error                // *domain.ValidationError or domain.ErrIdempotencyMismatch
+}
+
+type BatchResult struct {
+	Batch *domain.Batch // nil when no item was accepted and nothing was stored
+	Items []ItemResult
+}
+
+// CreateBatch validates every item and stores the valid ones together.
+// Invalid items are reported, not fatal: one bad phone number should not
+// block the other 999 messages. Items are idempotent through their own keys.
+func (s *Notifications) CreateBatch(ctx context.Context, reqs []domain.CreateRequest, correlationID string) (BatchResult, error) {
+	if len(reqs) == 0 || len(reqs) > domain.MaxBatchSize {
+		var v domain.ValidationError
+		v.Add("items", fmt.Sprintf("must contain between 1 and %d notifications", domain.MaxBatchSize))
+		return BatchResult{}, &v
+	}
+
+	batchID, err := uuid.NewV7()
+	if err != nil {
+		return BatchResult{}, err
+	}
+	now := s.now()
+	result := BatchResult{Items: make([]ItemResult, len(reqs))}
+	var (
+		valid   []domain.Notification
+		indexes []int // position in reqs of each valid notification
+	)
+	for i, req := range reqs {
+		result.Items[i].Index = i
+		n, err := domain.NewNotification(req, s.maxAttempts, now)
+		if err != nil {
+			result.Items[i].Err = err
+			continue
+		}
+		n.BatchID = &batchID
+		n.CorrelationID = correlationID
+		valid = append(valid, n)
+		indexes = append(indexes, i)
+	}
+	if len(valid) == 0 {
+		return result, nil
+	}
+
+	outcomes, batch, err := s.repo.CreateBatch(ctx, domain.Batch{
+		ID: batchID, Total: len(reqs), Accepted: len(valid), Rejected: len(reqs) - len(valid), CreatedAt: now,
+	}, valid, isReplay)
+	if err != nil {
+		return BatchResult{}, err
+	}
+	for j, o := range outcomes {
+		item := &result.Items[indexes[j]]
+		if !o.Created && !isReplay(valid[j], o.Stored) {
+			item.Err = domain.ErrIdempotencyMismatch
+			continue
+		}
+		stored := o.Stored
+		item.Notification = &stored
+		item.Created = o.Created
+	}
+	if batch.ID != uuid.Nil {
+		result.Batch = &batch
+	}
+	return result, nil
+}
+
+func (s *Notifications) GetBatch(ctx context.Context, id uuid.UUID) (domain.BatchSummary, error) {
+	return s.repo.GetBatch(ctx, id)
 }

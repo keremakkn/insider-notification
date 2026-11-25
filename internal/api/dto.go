@@ -83,3 +83,49 @@ type errorDetail struct {
 func errorBody(code, message string, fields []domain.FieldError) errorResponse {
 	return errorResponse{Error: errorDetail{Code: code, Message: message, Fields: fields}}
 }
+
+type batchRequest struct {
+	Items []batchItemRequest `json:"items"`
+}
+
+type batchItemRequest struct {
+	createRequest
+	IdempotencyKey string `json:"idempotencyKey"`
+}
+
+type batchResponse struct {
+	BatchID  string              `json:"batchId,omitempty"`
+	Total    int                 `json:"total"`
+	Accepted int                 `json:"accepted"`
+	Rejected int                 `json:"rejected"`
+	Items    []batchItemResponse `json:"items"`
+}
+
+type batchItemResponse struct {
+	Index     int          `json:"index"`
+	ID        string       `json:"id,omitempty"`
+	Status    string       `json:"status,omitempty"`
+	Duplicate bool         `json:"duplicate,omitempty"` // replay of an earlier request with the same key
+	Error     *errorDetail `json:"error,omitempty"`
+}
+
+type batchSummaryResponse struct {
+	ID           string         `json:"id"`
+	Total        int            `json:"total"`
+	Accepted     int            `json:"accepted"`
+	Rejected     int            `json:"rejected"`
+	StatusCounts map[string]int `json:"statusCounts"`
+	CreatedAt    time.Time      `json:"createdAt"`
+}
+
+func toBatchSummary(s domain.BatchSummary) batchSummaryResponse {
+	counts := map[string]int{}
+	// Always list every status, so clients do not have to treat a missing key as zero.
+	for _, st := range []domain.Status{domain.StatusPending, domain.StatusProcessing, domain.StatusSent, domain.StatusFailed, domain.StatusCancelled} {
+		counts[string(st)] = s.StatusCounts[st]
+	}
+	return batchSummaryResponse{
+		ID: s.ID.String(), Total: s.Total, Accepted: s.Accepted, Rejected: s.Rejected,
+		StatusCounts: counts, CreatedAt: s.CreatedAt,
+	}
+}

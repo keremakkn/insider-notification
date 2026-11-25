@@ -13,6 +13,7 @@ import (
 type ListFilter struct {
 	Status  *Status
 	Channel *Channel
+	BatchID *uuid.UUID
 	From    *time.Time // inclusive, on created_at
 	To      *time.Time // exclusive, on created_at
 	After   *Cursor    // continue after this position

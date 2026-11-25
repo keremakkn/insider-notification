@@ -35,19 +35,7 @@ const columns = `id, batch_id, idempotency_key, request_hash, correlation_id,
 // The unique index decides the winner, so concurrent requests with the same
 // key cannot both create a row; the follow-up SELECT is only a read.
 func (r *Notifications) Create(ctx context.Context, n domain.Notification) (stored domain.Notification, created bool, err error) {
-	row := r.db.QueryRow(ctx, `
-		INSERT INTO notifications (
-			id, batch_id, idempotency_key, request_hash, correlation_id,
-			recipient, channel, content, priority,
-			status, max_attempts, next_attempt_at, scheduled_at, created_at, updated_at)
-		VALUES ($1, $2, NULLIF($3, ''), NULLIF($4, ''), $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $14)
-		ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
-		RETURNING `+columns,
-		n.ID, n.BatchID, n.IdempotencyKey, n.RequestHash, n.CorrelationID,
-		n.Recipient, string(n.Channel), n.Content, int16(n.Priority),
-		string(n.Status), n.MaxAttempts, n.NextAttemptAt, n.ScheduledAt, n.CreatedAt)
-
-	stored, err = scan(row)
+	stored, err = scan(r.db.QueryRow(ctx, insertSQL, insertArgs(n)...))
 	if err == nil {
 		return stored, true, nil
 	}
@@ -61,6 +49,153 @@ func (r *Notifications) Create(ctx context.Context, n domain.Notification) (stor
 		return domain.Notification{}, false, fmt.Errorf("read notification for idempotency key: %w", err)
 	}
 	return stored, false, nil
+}
+
+const insertSQL = `
+	INSERT INTO notifications (
+		id, batch_id, idempotency_key, request_hash, correlation_id,
+		recipient, channel, content, priority,
+		status, max_attempts, next_attempt_at, scheduled_at, created_at, updated_at)
+	VALUES ($1, $2, NULLIF($3, ''), NULLIF($4, ''), $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $14)
+	ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
+	RETURNING ` + columns
+
+func insertArgs(n domain.Notification) []any {
+	return []any{
+		n.ID, n.BatchID, n.IdempotencyKey, n.RequestHash, n.CorrelationID,
+		n.Recipient, string(n.Channel), n.Content, int16(n.Priority),
+		string(n.Status), n.MaxAttempts, n.NextAttemptAt, n.ScheduledAt, n.CreatedAt,
+	}
+}
+
+// CreateBatch stores a batch and its notifications in one transaction.
+//
+// Items whose idempotency key already exists insert nothing. For each of
+// them, isReplay (the caller's business rule) decides whether the stored
+// notification is a legitimate replay (counted as accepted) or a key reused
+// for a different request (counted as rejected). b.Accepted and b.Rejected
+// must already count the items that failed validation; they are adjusted
+// for rejected replays. If nothing ends up accepted, the transaction is
+// rolled back and no batch is stored.
+//
+// The inserts are pipelined: one network round trip for the whole batch.
+func (r *Notifications) CreateBatch(
+	ctx context.Context,
+	b domain.Batch,
+	items []domain.Notification,
+	isReplay func(item, stored domain.Notification) bool,
+) ([]domain.CreateOutcome, domain.Batch, error) {
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return nil, domain.Batch{}, fmt.Errorf("begin batch: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op after commit
+
+	if err := tx.QueryRow(ctx, `
+		INSERT INTO batches (id, total, accepted, rejected, created_at)
+		VALUES ($1, $2, $3, $4, $5) RETURNING created_at`,
+		b.ID, b.Total, b.Accepted, b.Rejected, b.CreatedAt).Scan(&b.CreatedAt); err != nil {
+		return nil, domain.Batch{}, fmt.Errorf("insert batch: %w", err)
+	}
+
+	pipe := &pgx.Batch{}
+	for _, n := range items {
+		pipe.Queue(insertSQL, insertArgs(n)...)
+	}
+	results := tx.SendBatch(ctx, pipe)
+	outcomes := make([]domain.CreateOutcome, len(items))
+	var conflictKeys []string
+	for i := range items {
+		stored, err := scan(results.QueryRow())
+		switch {
+		case err == nil:
+			outcomes[i] = domain.CreateOutcome{Stored: stored, Created: true}
+		case errors.Is(err, pgx.ErrNoRows):
+			conflictKeys = append(conflictKeys, items[i].IdempotencyKey)
+		default:
+			results.Close()
+			return nil, domain.Batch{}, fmt.Errorf("insert batch item %d: %w", i, err)
+		}
+	}
+	if err := results.Close(); err != nil {
+		return nil, domain.Batch{}, fmt.Errorf("insert batch items: %w", err)
+	}
+
+	if len(conflictKeys) > 0 {
+		existing, err := r.byKeys(ctx, tx, conflictKeys)
+		if err != nil {
+			return nil, domain.Batch{}, err
+		}
+		for i, n := range items {
+			if outcomes[i].Created {
+				continue
+			}
+			stored := existing[n.IdempotencyKey]
+			outcomes[i].Stored = stored
+			if !isReplay(n, stored) {
+				b.Accepted--
+				b.Rejected++
+			}
+		}
+		if b.Accepted == 0 {
+			return outcomes, domain.Batch{}, nil // rollback: nothing new, no empty batch row
+		}
+		if _, err := tx.Exec(ctx, `UPDATE batches SET accepted = $2, rejected = $3 WHERE id = $1`,
+			b.ID, b.Accepted, b.Rejected); err != nil {
+			return nil, domain.Batch{}, fmt.Errorf("update batch counts: %w", err)
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, domain.Batch{}, fmt.Errorf("commit batch: %w", err)
+	}
+	return outcomes, b, nil
+}
+
+func (r *Notifications) byKeys(ctx context.Context, tx pgx.Tx, keys []string) (map[string]domain.Notification, error) {
+	rows, err := tx.Query(ctx, `SELECT `+columns+` FROM notifications WHERE idempotency_key = ANY($1)`, keys)
+	if err != nil {
+		return nil, fmt.Errorf("read existing idempotency keys: %w", err)
+	}
+	found, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (domain.Notification, error) { return scan(row) })
+	if err != nil {
+		return nil, fmt.Errorf("read existing idempotency keys: %w", err)
+	}
+	byKey := make(map[string]domain.Notification, len(found))
+	for _, n := range found {
+		byKey[n.IdempotencyKey] = n
+	}
+	return byKey, nil
+}
+
+// GetBatch returns a batch with a count of its notifications per status.
+func (r *Notifications) GetBatch(ctx context.Context, id uuid.UUID) (domain.BatchSummary, error) {
+	s := domain.BatchSummary{StatusCounts: map[domain.Status]int{}}
+	err := r.db.QueryRow(ctx, `SELECT id, total, accepted, rejected, created_at FROM batches WHERE id = $1`, id).
+		Scan(&s.ID, &s.Total, &s.Accepted, &s.Rejected, &s.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.BatchSummary{}, domain.ErrNotFound
+	}
+	if err != nil {
+		return domain.BatchSummary{}, fmt.Errorf("get batch: %w", err)
+	}
+
+	rows, err := r.db.Query(ctx, `SELECT status, count(*) FROM notifications WHERE batch_id = $1 GROUP BY status`, id)
+	if err != nil {
+		return domain.BatchSummary{}, fmt.Errorf("count batch statuses: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			status string
+			count  int
+		)
+		if err := rows.Scan(&status, &count); err != nil {
+			return domain.BatchSummary{}, err
+		}
+		s.StatusCounts[domain.Status(status)] = count
+	}
+	return s, rows.Err()
 }
 
 func (r *Notifications) Get(ctx context.Context, id uuid.UUID) (domain.Notification, error) {
@@ -112,6 +247,9 @@ func (r *Notifications) List(ctx context.Context, f domain.ListFilter) ([]domain
 	}
 	if f.Channel != nil {
 		add("channel = $%d", string(*f.Channel))
+	}
+	if f.BatchID != nil {
+		add("batch_id = $%d", *f.BatchID)
 	}
 	if f.From != nil {
 		add("created_at >= $%d", *f.From)

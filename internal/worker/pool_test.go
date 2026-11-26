@@ -21,6 +21,10 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	promtest "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/redis/go-redis/v9"
+	"go.opentelemetry.io/otel"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/keremakkn/insider-notification/internal/dispatcher"
 	"github.com/keremakkn/insider-notification/internal/domain"
@@ -29,6 +33,7 @@ import (
 	"github.com/keremakkn/insider-notification/internal/queue"
 	"github.com/keremakkn/insider-notification/internal/repository"
 	"github.com/keremakkn/insider-notification/internal/testutil"
+	"github.com/keremakkn/insider-notification/internal/tracing"
 )
 
 var (
@@ -301,6 +306,50 @@ func TestStatusChangesArePublished(t *testing.T) {
 	got := fmt.Sprint(s.events.statuses(ids[0]))
 	if got != "[processing pending processing sent]" {
 		t.Fatalf("want claim, retry, claim, sent; got %s", got)
+	}
+}
+
+// The trace started by the API request continues in the worker, across the
+// queue, and reaches the provider in the traceparent header.
+func TestDeliveryContinuesTheCreatingTrace(t *testing.T) {
+	spans := tracetest.NewSpanRecorder()
+	prev := otel.GetTracerProvider()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(spans))
+	otel.SetTracerProvider(tp)
+	t.Cleanup(func() { otel.SetTracerProvider(prev) })
+
+	var header atomic.Value
+	s := start(t, options{handler: func(w http.ResponseWriter, r *http.Request) {
+		header.Store(r.Header.Get("traceparent"))
+		w.WriteHeader(http.StatusAccepted)
+	}})
+
+	// Stand-in for the API request that created the notification.
+	ctx, create := tp.Tracer("api").Start(context.Background(), "notifications.create")
+	nt, _ := domain.NewNotification(domain.CreateRequest{Recipient: "+905551234567", Channel: "sms", Content: "hi"}, 5, time.Now().Add(-time.Second))
+	nt.CorrelationID, nt.TraceParent = "c", tracing.Inject(ctx)
+	create.End()
+	if _, _, err := s.repo.Create(context.Background(), nt); err != nil {
+		t.Fatal(err)
+	}
+	s.waitFor([]uuid.UUID{nt.ID}, 5*time.Second)
+
+	var deliver sdktrace.ReadOnlySpan
+	for _, sp := range spans.Ended() {
+		if sp.Name() == "notification.deliver" {
+			deliver = sp
+		}
+	}
+	if deliver == nil {
+		t.Fatal("no delivery span")
+	}
+	want := create.SpanContext()
+	if deliver.SpanContext().TraceID() != want.TraceID() || deliver.Parent().SpanID() != want.SpanID() {
+		t.Fatal("delivery must be a child of the creating span, in the same trace")
+	}
+	got := trace.SpanContextFromContext(tracing.Extract(context.Background(), header.Load().(string)))
+	if got.TraceID() != want.TraceID() {
+		t.Fatalf("the provider should receive the same trace in traceparent, got %q", header.Load())
 	}
 }
 

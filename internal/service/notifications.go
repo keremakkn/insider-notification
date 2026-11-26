@@ -8,9 +8,24 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/keremakkn/insider-notification/internal/domain"
+	"github.com/keremakkn/insider-notification/internal/tracing"
 )
+
+// endSpan marks unexpected failures on the span. A validation error is the
+// client's mistake, not the service's, so it does not turn the span red.
+func endSpan(span trace.Span, err error) {
+	var v *domain.ValidationError
+	if err != nil && !errors.As(err, &v) {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	}
+	span.End()
+}
 
 // Repository is what the service needs from storage. It is declared here,
 // where it is used, so tests can pass an in-memory fake.
@@ -106,6 +121,9 @@ func (s *Notifications) render(ctx context.Context, req *domain.CreateRequest, c
 // idempotency key was seen before with the same request; the original is
 // returned. The same key with a different request is ErrIdempotencyMismatch.
 func (s *Notifications) Create(ctx context.Context, req domain.CreateRequest, correlationID string) (n domain.Notification, created bool, err error) {
+	ctx, span := tracing.Tracer().Start(ctx, "notifications.create")
+	defer func() { endSpan(span, err) }()
+
 	if err := s.render(ctx, &req, map[uuid.UUID]domain.Template{}); err != nil {
 		return domain.Notification{}, false, err
 	}
@@ -114,6 +132,9 @@ func (s *Notifications) Create(ctx context.Context, req domain.CreateRequest, co
 		return domain.Notification{}, false, err
 	}
 	n.CorrelationID = correlationID
+	n.TraceParent = tracing.Inject(ctx) // the worker continues this trace
+	span.SetAttributes(attribute.String("notification.id", n.ID.String()),
+		attribute.String("notification.channel", string(n.Channel)), attribute.String("notification.priority", n.Priority.String()))
 
 	stored, created, err := s.repo.Create(ctx, n)
 	if err != nil {
@@ -178,7 +199,12 @@ type BatchResult struct {
 // CreateBatch validates every item and stores the valid ones together.
 // Invalid items are reported, not fatal: one bad phone number should not
 // block the other 999 messages. Items are idempotent through their own keys.
-func (s *Notifications) CreateBatch(ctx context.Context, reqs []domain.CreateRequest, correlationID string) (BatchResult, error) {
+func (s *Notifications) CreateBatch(ctx context.Context, reqs []domain.CreateRequest, correlationID string) (_ BatchResult, err error) {
+	ctx, span := tracing.Tracer().Start(ctx, "notifications.create_batch",
+		trace.WithAttributes(attribute.Int("batch.size", len(reqs))))
+	defer func() { endSpan(span, err) }()
+	traceparent := tracing.Inject(ctx)
+
 	if len(reqs) == 0 || len(reqs) > domain.MaxBatchSize {
 		var v domain.ValidationError
 		v.Add("items", fmt.Sprintf("must contain between 1 and %d notifications", domain.MaxBatchSize))
@@ -213,6 +239,7 @@ func (s *Notifications) CreateBatch(ctx context.Context, reqs []domain.CreateReq
 		}
 		n.BatchID = &batchID
 		n.CorrelationID = correlationID
+		n.TraceParent = traceparent
 		valid = append(valid, n)
 		indexes = append(indexes, i)
 	}

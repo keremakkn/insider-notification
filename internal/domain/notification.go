@@ -73,6 +73,7 @@ type Notification struct {
 	IdempotencyKey string // empty when the client sent none
 	RequestHash    string // empty exactly when IdempotencyKey is empty
 	CorrelationID  string
+	TraceParent    string // W3C trace context of the creating request; the worker continues it
 
 	Recipient  string
 	Channel    Channel

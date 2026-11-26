@@ -12,12 +12,16 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/time/rate"
 
 	"github.com/keremakkn/insider-notification/internal/domain"
 	"github.com/keremakkn/insider-notification/internal/events"
 	"github.com/keremakkn/insider-notification/internal/metrics"
 	"github.com/keremakkn/insider-notification/internal/provider"
+	"github.com/keremakkn/insider-notification/internal/tracing"
 )
 
 type Store interface {
@@ -144,6 +148,13 @@ func (p *Pool) process(ctx context.Context, id uuid.UUID, limiter *rate.Limiter)
 		"channel", n.Channel, "priority", n.Priority.String(), "attempt", n.Attempts)
 	p.cfg.Events.Publish(ctx, domain.ChangeOf(n, time.Now()))
 
+	// Continue the trace of the request that created the notification. The
+	// queue broke the in-process context; the row carried it across.
+	ctx, span := tracing.Tracer().Start(tracing.Extract(ctx, n.TraceParent), "notification.deliver",
+		trace.WithAttributes(attribute.String("notification.id", n.ID.String()),
+			attribute.String("notification.channel", string(n.Channel)), attribute.Int("notification.attempt", n.Attempts)))
+	defer span.End()
+
 	// The token is taken here, after the claim and right before the provider
 	// call, so nothing with a variable duration sits between the limiter and
 	// the request. Taken earlier, it would be spent late: while blocked on an
@@ -151,10 +162,16 @@ func (p *Pool) process(ctx context.Context, id uuid.UUID, limiter *rate.Limiter)
 	// query that takes 5 ms for one worker and 50 ms for another. Waiting
 	// here cannot cost the lease: a worker waits for at most the other
 	// workers of its channel, workers/rate = 20/100 = 0.2 s, against a 30 s lease.
+	_, wait := tracing.Tracer().Start(ctx, "rate_limit.wait")
 	_ = limiter.Wait(ctx) // ctx is not cancellable here, so Wait cannot fail
+	wait.End()
 
 	o, result := p.deliver(ctx, n)
 	p.record(n, o, result)
+	span.SetAttributes(attribute.String("notification.outcome", string(o.Status)))
+	if o.Status != domain.StatusSent {
+		span.SetStatus(codes.Error, o.Error)
+	}
 	err = p.store.Finish(ctx, n.ID, n.Attempts, o)
 	switch {
 	case errors.Is(err, domain.ErrLeaseLost):

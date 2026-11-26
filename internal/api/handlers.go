@@ -16,6 +16,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel/propagation"
 
 	"github.com/keremakkn/insider-notification/internal/domain"
 	"github.com/keremakkn/insider-notification/internal/health"
@@ -113,7 +115,13 @@ func NewRouter(o Options) http.Handler {
 			r.Put("/{id}", h.updateTemplate)
 		})
 	}
-	return r
+	// The server span wraps everything, so the correlation middleware can
+	// reuse its trace ID. Probes and scrapes would only add noise.
+	// An incoming traceparent (from a caller that traces) makes this request
+	// part of the caller's trace.
+	return otelhttp.NewHandler(r, "http",
+		otelhttp.WithPropagators(propagation.TraceContext{}),
+		otelhttp.WithFilter(func(r *http.Request) bool { return !quiet[r.URL.Path] }))
 }
 
 // create answers 202 for a new notification and 200 for an idempotent replay.

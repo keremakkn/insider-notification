@@ -585,15 +585,35 @@ flowchart LR
 
 ### 10.3 Distributed tracing
 
-OpenTelemetry spans are exported to Jaeger (included in `docker-compose`). The trace must follow a
-notification across the asynchronous gap:
+OpenTelemetry spans are exported over OTLP to Jaeger (UI at `http://localhost:16686`). Without
+`OTEL_EXPORTER_OTLP_ENDPOINT` tracing is a no-op, so tests and local runs need no collector.
 
-`HTTP request → INSERT → (dispatcher) → worker claim → provider call`
+A trace follows one notification across the asynchronous gap:
 
-The dispatcher breaks the in-process context, so the creating request's W3C `traceparent` is stored
-on the row. The worker restores it and starts its delivery span as a child. The provider request also
-carries the `traceparent` header. The trace ID doubles as the correlation ID, so a log line and a trace
-can be matched with one ID.
+```
++   0.0 ms    5.7 ms  notifier-api     POST /api/v1/notifications
++   0.1 ms    5.5 ms  notifier-api     notifications.create
++ 793.4 ms  221.6 ms  notifier-worker  notification.deliver
++ 793.4 ms    0.0 ms  notifier-worker  rate_limit.wait
++ 793.7 ms  213.3 ms  notifier-worker  HTTP POST              (to the provider)
+```
+
+(A real trace from a local run. The gap is the wait for the dispatcher's next tick, §9.)
+
+- **Across the queue.** The dispatcher breaks the in-process context. To bridge it, the create span's
+  W3C `traceparent` is stored on the row (migration 000004). The worker restores it, and
+  `notification.deliver` becomes a child of `notifications.create`. Every retry adds another
+  delivery span to the same trace.
+- **To the provider.** The provider request carries `traceparent`, so a provider that traces can
+  join the same trace.
+- **Explicit propagators.** The HTTP server and the provider client set the W3C propagator
+  explicitly. OpenTelemetry's global default writes nothing. A test caught the provider receiving no
+  header because it relied on that global default.
+- **Correlation ID.** Without `X-Correlation-ID`, the correlation ID is the trace ID, so one ID finds
+  both the log lines and the trace. A caller's own ID is kept and set as a span attribute, so the
+  trace can be searched by it.
+- **Span names and errors.** Spans are named by route pattern. Validation errors do not mark spans as
+  errors: they are the caller's mistake, not the service's.
 
 ### 10.4 CI/CD
 

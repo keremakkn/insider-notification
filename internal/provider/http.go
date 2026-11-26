@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel/propagation"
 )
 
 // Message is what the provider receives.
@@ -61,7 +63,12 @@ type HTTP struct {
 }
 
 func NewHTTP(url string, timeout time.Duration) *HTTP {
-	return &HTTP{url: url, client: &http.Client{Timeout: timeout}}
+	// otelhttp records a client span per call and sends the traceparent
+	// header, so a provider that traces can join the same trace. The
+	// propagator is explicit rather than the global default, which writes
+	// nothing unless someone remembered to configure it.
+	transport := otelhttp.NewTransport(http.DefaultTransport, otelhttp.WithPropagators(propagation.TraceContext{}))
+	return &HTTP{url: url, client: &http.Client{Timeout: timeout, Transport: transport}}
 }
 
 const maxResponseBytes = 64 << 10

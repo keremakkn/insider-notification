@@ -21,7 +21,7 @@ func NewNotifications(db *pgxpool.Pool) *Notifications {
 	return &Notifications{db: db}
 }
 
-const columns = `id, batch_id, idempotency_key, request_hash, correlation_id,
+const columns = `id, batch_id, idempotency_key, request_hash, correlation_id, traceparent,
 	recipient, channel, content, priority, template_id,
 	status, attempts, max_attempts,
 	next_attempt_at, scheduled_at, enqueued_at, lease_expires_at,
@@ -53,10 +53,10 @@ func (r *Notifications) Create(ctx context.Context, n domain.Notification) (stor
 
 const insertSQL = `
 	INSERT INTO notifications (
-		id, batch_id, idempotency_key, request_hash, correlation_id,
+		id, batch_id, idempotency_key, request_hash, correlation_id, traceparent,
 		recipient, channel, content, priority, template_id,
 		status, max_attempts, next_attempt_at, scheduled_at, created_at, updated_at)
-	VALUES ($1, $2, NULLIF($3, ''), NULLIF($4, ''), $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $15)
+	VALUES ($1, $2, NULLIF($3, ''), NULLIF($4, ''), $5, NULLIF($16, ''), $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $15)
 	ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
 	RETURNING ` + columns
 
@@ -65,6 +65,7 @@ func insertArgs(n domain.Notification) []any {
 		n.ID, n.BatchID, n.IdempotencyKey, n.RequestHash, n.CorrelationID,
 		n.Recipient, string(n.Channel), n.Content, int16(n.Priority), n.TemplateID,
 		string(n.Status), n.MaxAttempts, n.NextAttemptAt, n.ScheduledAt, n.CreatedAt,
+		n.TraceParent,
 	}
 }
 
@@ -289,13 +290,13 @@ func (r *Notifications) List(ctx context.Context, f domain.ListFilter) ([]domain
 
 func scan(row pgx.Row) (domain.Notification, error) {
 	var (
-		n                                     domain.Notification
-		idemKey, reqHash, providerID, lastErr *string
-		channel, status                       string
-		priority                              int16
+		n                                                  domain.Notification
+		idemKey, reqHash, providerID, lastErr, traceParent *string
+		channel, status                                    string
+		priority                                           int16
 	)
 	err := row.Scan(
-		&n.ID, &n.BatchID, &idemKey, &reqHash, &n.CorrelationID,
+		&n.ID, &n.BatchID, &idemKey, &reqHash, &n.CorrelationID, &traceParent,
 		&n.Recipient, &channel, &n.Content, &priority, &n.TemplateID,
 		&status, &n.Attempts, &n.MaxAttempts,
 		&n.NextAttemptAt, &n.ScheduledAt, &n.EnqueuedAt, &n.LeaseExpiresAt,
@@ -312,6 +313,7 @@ func scan(row pgx.Row) (domain.Notification, error) {
 	n.RequestHash = deref(reqHash)
 	n.ProviderMessageID = deref(providerID)
 	n.LastError = deref(lastErr)
+	n.TraceParent = deref(traceParent)
 	return n, nil
 }
 

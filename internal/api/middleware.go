@@ -11,6 +11,8 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/keremakkn/insider-notification/internal/metrics"
 )
@@ -28,12 +30,20 @@ func CorrelationIDFrom(ctx context.Context) string {
 // Only accept IDs that are safe to log and store; anything else is replaced.
 var validCorrelationID = regexp.MustCompile(`^[A-Za-z0-9._-]{1,128}$`)
 
-// correlationID reuses the caller's X-Correlation-ID when it is well formed,
-// or generates one, and echoes it in the response.
+// correlationID reuses the caller's X-Correlation-ID when it is well formed.
+// Otherwise it is the request's trace ID, so one ID finds both the log lines
+// and the trace. A caller's own ID is added to the span, so the trace can be
+// found by it too.
 func correlationID(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id := r.Header.Get(CorrelationHeader)
-		if !validCorrelationID.MatchString(id) {
+		span := trace.SpanFromContext(r.Context())
+		switch {
+		case validCorrelationID.MatchString(id):
+			span.SetAttributes(attribute.String("correlation_id", id))
+		case span.SpanContext().HasTraceID():
+			id = span.SpanContext().TraceID().String()
+		default:
 			id = uuid.NewString()
 		}
 		w.Header().Set(CorrelationHeader, id)
@@ -105,6 +115,8 @@ func observe(m *metrics.API) func(http.Handler) http.Handler {
 			if rc := chi.RouteContext(r.Context()); rc != nil && rc.RoutePattern() != "" {
 				route = rc.RoutePattern()
 			}
+			// The route is only known after routing; name the span by it.
+			trace.SpanFromContext(r.Context()).SetName(r.Method + " " + route)
 			m.Requests.WithLabelValues(r.Method, route, strconv.Itoa(ww.Status())).Observe(time.Since(start).Seconds())
 		})
 	}

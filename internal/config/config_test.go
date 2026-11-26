@@ -55,6 +55,11 @@ func TestRejectsUnsafeCombinations(t *testing.T) {
 		{"bad integer", map[string]string{"WORKERS_PER_CHANNEL": "many"}, "not an integer"},
 		{"bad duration", map[string]string{"LEASE_DURATION": "30"}, "not a duration"},
 		{"wrong number of weights", map[string]string{"PRIORITY_WEIGHTS": "6,3"}, "want 3"},
+		{"negative provider limit", map[string]string{"PROVIDER_RATE_LIMIT": "-1"}, "PROVIDER_RATE_LIMIT"},
+		// 60 workers queued at 2/s wait 30 s, longer than the 30 s lease.
+		{"provider limit so slow the lease runs out", map[string]string{"PROVIDER_RATE_LIMIT": "2"}, "rate-limit wait"},
+		{"explicit thresholds too long for a slow provider",
+			map[string]string{"PROVIDER_RATE_LIMIT": "5", "QUEUE_THRESHOLDS": "600,300,100"}, "VISIBILITY_TIMEOUT"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -63,5 +68,46 @@ func TestRejectsUnsafeCombinations(t *testing.T) {
 				t.Fatalf("want error containing %q, got %v", tt.wantErr, err)
 			}
 		})
+	}
+}
+
+// Without a provider limit nothing changes: each channel drains at its own rate.
+func TestNoProviderLimitByDefault(t *testing.T) {
+	c, _ := load(env(nil))
+	if c.ProviderRateLimit != 0 || c.ChannelDrainRate() != 100 || c.MaxLimiterWait() != 200*time.Millisecond {
+		t.Fatalf("provider=%d drain=%v wait=%s", c.ProviderRateLimit, c.ChannelDrainRate(), c.MaxLimiterWait())
+	}
+}
+
+// A provider limit (free webhook.site) is shared by the three channels, and
+// the default queue thresholds shrink with it so a full queue still drains
+// in about 10 s instead of outliving the visibility timeout.
+func TestProviderLimitShrinksQueues(t *testing.T) {
+	c, err := load(env(map[string]string{"PROVIDER_RATE_LIMIT": "6"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.ChannelDrainRate() != 2 { // 6/s over three channels
+		t.Fatalf("ChannelDrainRate = %v, want 2", c.ChannelDrainRate())
+	}
+	if c.QueueThresholds != [3]int{12, 6, 2} {
+		t.Fatalf("QueueThresholds = %v, want [12 6 2]", c.QueueThresholds)
+	}
+	if got := c.MaxQueueWait(); got != 10*time.Second {
+		t.Fatalf("MaxQueueWait = %s, want 10s", got)
+	}
+	if got := c.MaxLimiterWait(); got != 10*time.Second { // 60 workers at 6/s
+		t.Fatalf("MaxLimiterWait = %s, want 10s", got)
+	}
+}
+
+// A provider limit above the sum of the channel limits never binds.
+func TestGenerousProviderLimitChangesNothing(t *testing.T) {
+	c, err := load(env(map[string]string{"PROVIDER_RATE_LIMIT": "1000"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.ChannelDrainRate() != 100 || c.QueueThresholds != [3]int{600, 300, 100} {
+		t.Fatalf("drain=%v thresholds=%v", c.ChannelDrainRate(), c.QueueThresholds)
 	}
 }

@@ -23,13 +23,23 @@ Requires Docker.
 docker compose up --build
 ```
 
+This needs Docker Compose v2.24 or newer (`docker compose`, not the old Python `docker-compose`
+v1), because `.env` is marked optional in `docker-compose.yml`.
+
+To run more worker processes, scale them. The rate limit is shared through Redis, so it stays at
+100 messages per second per channel in total:
+
+```sh
+docker compose up --build --scale worker=3
+```
+
 | What | Where |
 |---|---|
 | API | http://localhost:8080 |
 | API docs (Swagger UI) | http://localhost:8080/docs |
 | Delivery snapshot | http://localhost:8080/api/v1/stats |
 | Traces (Jaeger) | http://localhost:16686 |
-| Worker metrics | http://localhost:9091/metrics |
+| Worker metrics | http://localhost:9091/metrics (9092 and up for scaled workers) |
 
 Out of the box, notifications go to a bundled **mock provider**, so nothing has to be configured.
 To use [webhook.site](https://webhook.site) instead:
@@ -41,6 +51,19 @@ To use [webhook.site](https://webhook.site) instead:
 ```sh
 cp .env.example .env   # then set PROVIDER_URL=https://webhook.site/<your-uuid>
 docker compose up --build
+```
+
+**A free webhook.site URL accepts a limited number of requests in total.** After that it answers
+every request with `429` ("Request limit exceeded"), so use a fresh URL for a demo and the mock
+provider for load tests. Nothing is lost when it happens: `429` is retried with backoff (honouring
+`Retry-After` when present), the circuit breaker stops sending after repeated failures, and
+notifications that run out of attempts end as `failed` with the provider's answer in `lastError`.
+
+If a provider limits requests per second across all channels, set `PROVIDER_RATE_LIMIT`. It caps
+all channels and worker processes together, and the queue thresholds shrink with it automatically:
+
+```sh
+PROVIDER_RATE_LIMIT=5   # in .env
 ```
 
 ## Try it
@@ -132,10 +155,12 @@ The main decisions are below. [DESIGN.md](docs/DESIGN.md) gives the reasoning fo
   of a burst waits in PostgreSQL.
 - **Priority without starvation.** Workers use smooth weighted round-robin (6/3/1), so `low` always
   gets its share.
-- **Rate limit.** One token bucket per channel. The token is taken right before the provider call.
-  Taking it earlier let the limit be exceeded, and both earlier placements were caught by tests.
+- **Rate limit.** One limit per channel, shared by every worker process through Redis (a GCRA-style
+  slot reservation on Redis's clock), so scaling out does not multiply it. The slot is taken right
+  before the provider call. Taking it earlier let the limit be exceeded, and both earlier placements
+  were caught by tests.
 - **Retries.** Capped exponential backoff with jitter, and `Retry-After` is honoured. 4xx answers
-  fail at once. A per-channel circuit breaker stops sending to a provider that is down, so messages
+  fail at once, except 408 and 429. A per-channel circuit breaker stops sending to a provider that is down, so messages
   keep their attempts.
 
 ## What the tests show
@@ -180,7 +205,8 @@ All settings are environment variables with working defaults. The full list is i
 | Variable | Default | |
 |---|---|---|
 | `PROVIDER_URL` | bundled mock provider | e.g. your webhook.site URL |
-| `RATE_LIMIT_PER_CHANNEL` | 100 | messages per second per channel |
+| `RATE_LIMIT_PER_CHANNEL` | 100 | messages per second per channel, across all worker processes |
+| `PROVIDER_RATE_LIMIT` | 0 (off) | the provider's own requests-per-second limit, shared by all channels |
 | `WORKERS_PER_CHANNEL` | 20 | rate × provider latency (Little's law) |
 | `PRIORITY_WEIGHTS` | 6,3,1 | high, normal, low |
 | `MAX_ATTEMPTS`, `RETRY_BASE`, `RETRY_CAP` | 5, 1s, 5m | |
@@ -221,8 +247,9 @@ migrations/              versioned schema (golang-migrate)
 
 - **Latency of the outbox.** A notification waits up to one dispatcher tick (1 s) before it is
   queued. PostgreSQL `LISTEN/NOTIFY` could wake the dispatcher on insert.
-- **The rate limiter is per process.** Two worker processes would send 200/s per channel. Scaling
-  out needs a shared limiter, for example in Redis.
+- **The rate limiter needs Redis.** If Redis is unreachable, each worker process falls back to its
+  own in-process limit, so with N processes the total can reach N × 100/s until Redis is back. In
+  practice workers cannot dequeue from Redis either, so little is sent meanwhile.
 - **SMS is one segment.** Multi-part SMS (153/67 characters per part) is not supported.
 - **`sent` means accepted.** Delivery receipts from the provider would add a `delivered` status.
 - **No authentication or tenants.** Idempotency keys are global. With tenants they would be scoped

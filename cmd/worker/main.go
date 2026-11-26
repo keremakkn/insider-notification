@@ -25,6 +25,7 @@ import (
 	"github.com/keremakkn/insider-notification/internal/metrics"
 	"github.com/keremakkn/insider-notification/internal/provider"
 	"github.com/keremakkn/insider-notification/internal/queue"
+	"github.com/keremakkn/insider-notification/internal/ratelimit"
 	"github.com/keremakkn/insider-notification/internal/repository"
 	"github.com/keremakkn/insider-notification/internal/tracing"
 	"github.com/keremakkn/insider-notification/internal/worker"
@@ -88,6 +89,13 @@ func run() error {
 		Events:            ev,
 	}, log)
 
+	// The provider's own requests-per-second limit, if it has one, shared by
+	// every channel: they all post to this one provider, up to 3 × 100/s.
+	var providerLimiter worker.Limiter
+	if cfg.ProviderRateLimit > 0 {
+		providerLimiter = ratelimit.NewRedis(rdb, "ratelimit:provider", cfg.ProviderRateLimit, log)
+	}
+
 	// Every channel uses the same provider here; each could get its own.
 	sender := provider.NewHTTP(cfg.ProviderURL, cfg.ProviderTimeout)
 	senders := map[domain.Channel]provider.Sender{
@@ -96,12 +104,18 @@ func run() error {
 	pool := worker.NewPool(repo, q, senders, worker.Config{
 		WorkersPerChannel: cfg.WorkersPerChannel,
 		RatePerSecond:     cfg.RateLimitPerChannel,
-		Lease:             cfg.LeaseDuration,
-		Backoff:           worker.NewBackoff(cfg.RetryBase, cfg.RetryCap),
-		BreakerThreshold:  cfg.BreakerThreshold,
-		BreakerCooldown:   cfg.BreakerCooldown,
-		Metrics:           m,
-		Events:            ev,
+		// Shared through Redis, so the limit holds per channel across every
+		// worker process (docker compose up --scale worker=N).
+		NewLimiter: func(c domain.Channel) worker.Limiter {
+			return ratelimit.NewRedis(rdb, "ratelimit:"+string(c), cfg.RateLimitPerChannel, log)
+		},
+		ProviderLimiter:  providerLimiter,
+		Lease:            cfg.LeaseDuration,
+		Backoff:          worker.NewBackoff(cfg.RetryBase, cfg.RetryCap),
+		BreakerThreshold: cfg.BreakerThreshold,
+		BreakerCooldown:  cfg.BreakerCooldown,
+		Metrics:          m,
+		Events:           ev,
 	}, log)
 
 	// The worker serves no API, only probes and metrics for operators.
@@ -120,7 +134,8 @@ func run() error {
 	}()
 	defer ops.Close()
 
-	log.Info("worker started", "workers_per_channel", cfg.WorkersPerChannel, "rate_per_channel", cfg.RateLimitPerChannel)
+	log.Info("worker started", "workers_per_channel", cfg.WorkersPerChannel, "rate_per_channel", cfg.RateLimitPerChannel,
+		"provider_rate_limit", cfg.ProviderRateLimit, "queue_thresholds", cfg.QueueThresholds)
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() { defer wg.Done(); disp.Run(ctx) }()

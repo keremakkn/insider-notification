@@ -21,7 +21,7 @@ The resulting guarantees:
 | An accepted notification is never lost | PostgreSQL is the source of truth; a dispatcher re-queues anything that is pending but not in the queue (§5) |
 | One request creates at most one notification | `Idempotency-Key` + unique index + request hash (§4.2) |
 | Delivery is **at-least-once** | A crash after the provider accepted but before the DB update causes one resend; the provider receives `X-Idempotency-Key` so it can drop the duplicate (§6.6) |
-| At most 100 messages/s per channel | Token bucket per channel in each worker process (§6.2) |
+| At most 100 messages/s per channel | One limit per channel shared by all worker processes through Redis (§6.2) |
 | High priority goes first, low priority is never starved | Weighted dequeue 6/3/1 (§6.3) and dispatcher fill order (§5.3) |
 
 ## 2. System overview
@@ -331,14 +331,45 @@ placements were tried and tests rejected both:
 
 That placement was originally chosen out of fear that a claimed message waiting for a token would
 outlive its lease. The fear was unfounded. A worker waits only for the other workers of its channel
-(`workers / rate = 20 / 100 = 0.2 s`), not for the queue, and the lease is 30 s. With the token
+(`processes × workers / rate`, for example `2 × 20 / 100 = 0.4 s`), not for the queue, and the lease is 30 s. With the token
 immediately before the request, the busiest second stays at 51 (limit plus a burst of 1). Under
 heavy load with the race detector it occasionally shows 52. That comes from timer wake-ups that run
 late, not from extra tokens, and the test allows two requests for it. As a side benefit, a failed claim no longer wastes a token.
 
-The limiter is `golang.org/x/time/rate`, one token bucket per channel (100/s, burst 1), shared by
-all workers of that channel in the process. It is in memory, so two worker processes would allow
-200/s in total. Scaling out would need a Redis-based limiter. This is documented as a known limitation.
+The limiter is shared through Redis (`internal/ratelimit`), one key per channel
+(`ratelimit:sms` and so on), so the limit holds across every worker process. A Lua script hands out
+send slots one interval apart (10 ms at 100/s), GCRA in its reservation form: the key stores the
+next free slot, a caller takes it, moves it one interval on, and sleeps until its slot. The clock
+is Redis `TIME`, so skew between worker machines does not matter, and the key expires once its slot
+is in the past. Like the in-process bucket it replaced (`golang.org/x/time/rate`, burst 1), it
+allows at most one call per interval, so any second holds at most rate + 1.
+
+The first version was that in-process bucket, which was correct for one worker process only: two
+processes would send 200/s. `TestRateLimitHoldsAcrossWorkerProcesses` runs two worker pools side by
+side. With per-process limiters the busiest second had 101 requests against a limit of 50; with the
+shared limiter it has 51 to 52.
+
+**Provider quota.** The channel limit is the service's own rule. A provider can have a stricter one
+that covers all channels together: here all three post to one URL, so they may send it 3 × 100/s.
+`PROVIDER_RATE_LIMIT` adds a second shared limiter (`ratelimit:provider`) that every
+channel and process passes through. The provider slot is taken first and the channel slot last, so
+the channel limit, the one the service promises, stays exact at the request.
+`TestProviderLimitCapsAllChannelsTogether` sends 75 messages over three channels and two processes
+with a 20/s quota: the busiest second has 21 requests (75 without the quota). A lower quota also
+slows draining, so the default `QUEUE_THRESHOLDS` are derived from the real drain rate (10 s of
+work per queue: 600/300/100 at 100/s, 10/5/2 at a 5/s quota), and config rejects a quota so slow
+that a claimed message could outwait its lease (`workers × channels / quota + PROVIDER_TIMEOUT`
+must stay under `LEASE_DURATION`).
+
+A free webhook.site URL has a different limit: a total number of requests, after which it answers
+every request with `429` ("Request limit exceeded"). No rate limit avoids that. The service handles
+it like any provider outage: retries with backoff, the circuit breaker, and `failed` with the
+provider's answer once attempts run out.
+
+If Redis cannot be reached, the limiter falls back to the in-process bucket rather than stopping
+delivery, since the worker has already claimed the notification. Each process then keeps its own
+limit until Redis answers again. In practice the workers cannot dequeue either, so little gets
+that far.
 
 ### 6.3 Weighted priority
 
@@ -399,7 +430,7 @@ flowchart TD
     R[Provider result] --> S{Outcome}
     S -->|2xx| OK[sent]
     S -->|timeout / connection error| RT
-    S -->|5xx or 429| RT
+    S -->|5xx, 408 or 429| RT
     S -->|other 4xx| F[failed: permanent]
     RT{attempts < max?} -->|yes| B["next_attempt_at = now + min(base·2^attempt + jitter, cap)<br/>Retry-After wins on 429"]
     B --> P[pending, enqueued_at = NULL<br/>dispatcher picks it up]
@@ -434,7 +465,7 @@ stateDiagram-v2
     half_open --> open: probe fails
 ```
 
-- **What counts as a failure:** 5xx, 429, timeouts and connection errors, meaning the provider is
+- **What counts as a failure:** 5xx, 408, 429, timeouts and connection errors, meaning the provider is
   struggling. A 400 does not count: the provider answered, and the message is the problem.
 - **Open:** the channel's workers stop popping. Messages wait in Redis and PostgreSQL **with their
   attempts untouched**, so an outage longer than the retry budget does not fail them all.
@@ -463,7 +494,7 @@ With the index on `(created_at DESC, id DESC)`, every page costs the same.
 
 | Endpoint | Process | For | Content |
 |---|---|---|---|
-| `GET /api/v1/stats?window=5m` | api | people | JSON per channel: queue depth, pending, processing, sent and failed in the window, provider success rate, p50/p95 provider latency and end-to-end latency |
+| `GET /api/v1/stats?window=5m` | api | people | JSON per channel: queue depth, pending (and how many of those are not due yet: scheduled or backing off), processing, sent and failed in the window, provider success rate, p50/p95 provider latency and end-to-end latency |
 | `GET /metrics` | api `:8080`, worker `:9091` | Prometheus | Counters and histograms (below) |
 | `GET /healthz` | both | liveness | Always 200 while the process runs. Restarting would not fix a database outage, so no dependency is checked |
 | `GET /readyz` | both | readiness | Pings PostgreSQL and Redis; 503 naming the failing one |
@@ -628,16 +659,17 @@ GitHub Actions on every push and pull request:
 | Variable | Default |
 |---|---|
 | `RATE_LIMIT_PER_CHANNEL` | 100 |
+| `PROVIDER_RATE_LIMIT` | 0 (no provider quota) |
 | `WORKERS_PER_CHANNEL` | 20 |
 | `PRIORITY_WEIGHTS` | 6,3,1 |
-| `QUEUE_THRESHOLDS` | 600,300,100 |
+| `QUEUE_THRESHOLDS` | 10 s of each queue's drain rate: 600,300,100 at 100/s |
 | `DISPATCH_INTERVAL` | 1s |
 | `VISIBILITY_TIMEOUT` | 5m |
 | `LEASE_DURATION` | 30s |
 | `PROVIDER_TIMEOUT` | 5s |
 | `RETRY_BASE`, `RETRY_CAP`, `MAX_ATTEMPTS` | 1s, 5m, 5 |
 | `BREAKER_THRESHOLD`, `BREAKER_COOLDOWN` | 5, 30s |
-| `PROVIDER_URL` | webhook.site URL |
+| `PROVIDER_URL` | bundled mock provider; your webhook.site URL in `.env` |
 | `METRICS_ADDR` | :9091 (worker) |
 | `WS_ALLOWED_ORIGINS` | localhost:* |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Jaeger collector |
@@ -652,7 +684,8 @@ GitHub Actions on every push and pull request:
 | Repository | `internal/repository` | All SQL | Make business decisions |
 | Queue | `internal/queue` | Redis lists behind an interface | Know what a notification means |
 | Dispatcher | `internal/dispatcher` | Outbox, backpressure, lease recovery | Call the provider |
-| Worker | `internal/worker` | Rate limit, dequeue, claim, deliver, retry | Parse HTTP requests |
+| Worker | `internal/worker` | Dequeue, claim, deliver, retry | Parse HTTP requests |
+| Rate limit | `internal/ratelimit` | Per-channel limit shared by all worker processes (Redis) | Know what is being sent |
 | Provider | `internal/provider` | HTTP client for the provider | Touch the database |
 | Events | `internal/events` | Publish and subscribe status events (Redis Pub/Sub) | Decide status |
 | Realtime | `internal/realtime` | WebSocket hub: clients and subscriptions | Read the database |
@@ -666,7 +699,7 @@ Dependencies point inward. Interfaces are declared where they are used, so each 
 | Dependency injection | `cmd/*/main.go` | No globals, easy tests |
 | Strategy | provider per channel | Add a channel without touching the worker |
 | Producer–consumer, worker pool | dispatcher → workers | Bounded concurrency |
-| Token bucket | rate limiter | 100 msg/s with small bursts |
+| GCRA (slot reservation) | rate limiter | 100 msg/s per channel across all processes |
 | Middleware | correlation ID, logging, recovery | Cross-cutting concerns outside handlers |
 | State machine | notification status | Only valid transitions, enforced in SQL |
 | Circuit breaker | provider client | Stop hammering a provider that is down |
@@ -689,7 +722,7 @@ Dependencies point inward. Interfaces are declared where they are used, so each 
 ## 14. Known limitations
 
 - At-least-once delivery: a crash at the wrong moment sends a notification twice (§6.6).
-- The rate limiter is per process; multiple worker processes need a shared (Redis) limiter.
+- The rate limiter needs Redis; without it each worker process falls back to its own limit (§6.2).
 - SMS is limited to a single segment; multi-part SMS (153/67 characters per part) is not supported.
 - No delivery receipts: `sent` means accepted by the provider.
 - WebSocket events are best-effort (Pub/Sub); the WebSocket hub is per API process, which is fine

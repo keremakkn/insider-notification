@@ -15,12 +15,12 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
-	"golang.org/x/time/rate"
 
 	"github.com/keremakkn/insider-notification/internal/domain"
 	"github.com/keremakkn/insider-notification/internal/events"
 	"github.com/keremakkn/insider-notification/internal/metrics"
 	"github.com/keremakkn/insider-notification/internal/provider"
+	"github.com/keremakkn/insider-notification/internal/ratelimit"
 	"github.com/keremakkn/insider-notification/internal/tracing"
 )
 
@@ -33,15 +33,28 @@ type Queue interface {
 	Pop(ctx context.Context, c domain.Channel) (uuid.UUID, domain.Priority, bool, error)
 }
 
+// Limiter spaces provider calls for one channel. Wait returns when the
+// caller may send, or an error when ctx ends first.
+type Limiter interface {
+	Wait(ctx context.Context) error
+}
+
 type Config struct {
 	WorkersPerChannel int
-	RatePerSecond     int           // per channel
-	Lease             time.Duration // must outlive the provider timeout
-	Backoff           Backoff       // wait before a retryable failure is tried again
-	BreakerThreshold  int           // consecutive provider failures that open a channel's breaker
-	BreakerCooldown   time.Duration // how long it stays open before one probe
-	Metrics           *metrics.Delivery
-	Events            events.Publisher // announces every status change
+	RatePerSecond     int // per channel
+	// NewLimiter returns the limiter for one channel, shared by that
+	// channel's workers. Nil means an in-process limiter at RatePerSecond,
+	// which is only correct while a single worker process runs.
+	NewLimiter func(c domain.Channel) Limiter
+	// ProviderLimiter, if set, is shared by every channel: the provider's
+	// own quota (PROVIDER_RATE_LIMIT), on top of the channel limits.
+	ProviderLimiter  Limiter
+	Lease            time.Duration // must outlive the provider timeout
+	Backoff          Backoff       // wait before a retryable failure is tried again
+	BreakerThreshold int           // consecutive provider failures that open a channel's breaker
+	BreakerCooldown  time.Duration // how long it stays open before one probe
+	Metrics          *metrics.Delivery
+	Events           events.Publisher // announces every status change
 }
 
 type Pool struct {
@@ -86,9 +99,11 @@ func (p *Pool) Breaker(c domain.Channel) *Breaker { return p.breakers[c] }
 func (p *Pool) Run(ctx context.Context) {
 	var wg sync.WaitGroup
 	for _, c := range domain.Channels {
-		// One bucket per channel shared by its workers. Burst 1: tokens do
-		// not pile up while idle, so no second ever exceeds the limit.
-		limiter := rate.NewLimiter(rate.Limit(p.cfg.RatePerSecond), 1)
+		// One limiter per channel, shared by its workers.
+		var limiter Limiter = ratelimit.Local(p.cfg.RatePerSecond)
+		if p.cfg.NewLimiter != nil {
+			limiter = p.cfg.NewLimiter(c)
+		}
 		for range p.cfg.WorkersPerChannel {
 			wg.Add(1)
 			go func() {
@@ -100,7 +115,7 @@ func (p *Pool) Run(ctx context.Context) {
 	wg.Wait()
 }
 
-func (p *Pool) loop(ctx context.Context, c domain.Channel, limiter *rate.Limiter, breaker *Breaker) {
+func (p *Pool) loop(ctx context.Context, c domain.Channel, limiter Limiter, breaker *Breaker) {
 	for ctx.Err() == nil {
 		// While the breaker is open, leave messages where they are: in Redis
 		// and PostgreSQL, with their attempts untouched.
@@ -132,7 +147,7 @@ func (p *Pool) loop(ctx context.Context, c domain.Channel, limiter *rate.Limiter
 	}
 }
 
-func (p *Pool) process(ctx context.Context, id uuid.UUID, limiter *rate.Limiter) Result {
+func (p *Pool) process(ctx context.Context, id uuid.UUID, limiter Limiter) Result {
 	n, ok, err := p.store.Claim(ctx, id, p.cfg.Lease)
 	if err != nil {
 		p.log.Error("claim", "notification_id", id, "error", err)
@@ -161,9 +176,20 @@ func (p *Pool) process(ctx context.Context, id uuid.UUID, limiter *rate.Limiter)
 	// empty queue (idle workers then burst together), or behind a claim
 	// query that takes 5 ms for one worker and 50 ms for another. Waiting
 	// here cannot cost the lease: a worker waits for at most the other
-	// workers of its channel, workers/rate = 20/100 = 0.2 s, against a 30 s lease.
+	// workers of its channel in every process, processes × workers / rate
+	// (2 × 20 / 100 = 0.4 s), against a 30 s lease.
+	//
+	// With a provider quota the provider slot comes first and the channel
+	// slot last, so the channel limit, which the service promises, is the
+	// one enforced exactly at the request. The provider limit is then off by
+	// at most the channel wait, which is near zero whenever the quota is the
+	// tighter of the two.
 	_, wait := tracing.Tracer().Start(ctx, "rate_limit.wait")
-	_ = limiter.Wait(ctx) // ctx is not cancellable here, so Wait cannot fail
+	// ctx is not cancellable here and the Redis limiter falls back, so Wait cannot fail.
+	if p.cfg.ProviderLimiter != nil {
+		_ = p.cfg.ProviderLimiter.Wait(ctx)
+	}
+	_ = limiter.Wait(ctx)
 	wait.End()
 
 	o, result := p.deliver(ctx, n)

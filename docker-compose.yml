@@ -67,7 +67,8 @@ services:
     environment:
       <<: *app-env
       PROVIDER_URL: ${PROVIDER_URL:-http://mockprovider:8090/send}
-    ports: ["9091:9091"]
+    # A range, so `--scale worker=N` (up to 5) gives each worker its own metrics port.
+    ports: ["9091-9095:9091"]
     depends_on: *app-deps
 
 volumes:

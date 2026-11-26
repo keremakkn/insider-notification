@@ -31,6 +31,7 @@ import (
 	"github.com/keremakkn/insider-notification/internal/metrics"
 	"github.com/keremakkn/insider-notification/internal/provider"
 	"github.com/keremakkn/insider-notification/internal/queue"
+	"github.com/keremakkn/insider-notification/internal/ratelimit"
 	"github.com/keremakkn/insider-notification/internal/repository"
 	"github.com/keremakkn/insider-notification/internal/testutil"
 	"github.com/keremakkn/insider-notification/internal/tracing"
@@ -157,12 +158,15 @@ func (s slowClaims) Claim(ctx context.Context, id uuid.UUID, lease time.Duration
 }
 
 type options struct {
-	slowClaims bool
-	breaker    int // consecutive failures that open the breaker; 0 means effectively off
-	rate       int
-	workers    int
-	maxAttempt int
-	handler    func(w http.ResponseWriter, r *http.Request)
+	slowClaims   bool
+	breaker      int // consecutive failures that open the breaker; 0 means effectively off
+	rate         int
+	workers      int
+	maxAttempt   int
+	processes    int  // worker pools running side by side, like worker containers; 0 means 1
+	redisLimit   bool // share the rate limit through Redis instead of per pool
+	providerRate int  // provider quota shared by all channels and pools; 0 means none
+	handler      func(w http.ResponseWriter, r *http.Request)
 }
 
 // start runs a dispatcher and a worker pool against real PostgreSQL and
@@ -188,6 +192,9 @@ func start(t *testing.T, o options) *system {
 	if o.breaker == 0 {
 		o.breaker = 1_000_000
 	}
+	if o.processes == 0 {
+		o.processes = 1
+	}
 	fp := &fakeProvider{handler: o.handler}
 	srv := httptest.NewServer(fp)
 	t.Cleanup(srv.Close)
@@ -207,16 +214,36 @@ func start(t *testing.T, o options) *system {
 	if o.slowClaims {
 		store = slowClaims{repo}
 	}
-	workers := NewPool(store, q, senders, Config{
-		WorkersPerChannel: o.workers, RatePerSecond: o.rate, Lease: 10 * time.Second,
-		Backoff:          NewBackoff(25*time.Millisecond, 100*time.Millisecond),
-		BreakerThreshold: o.breaker, BreakerCooldown: 300 * time.Millisecond, Metrics: m, Events: ev,
-	}, log)
+	var pools []*Pool
+	for range o.processes {
+		cfg := Config{
+			WorkersPerChannel: o.workers, RatePerSecond: o.rate, Lease: 10 * time.Second,
+			Backoff:          NewBackoff(25*time.Millisecond, 100*time.Millisecond),
+			BreakerThreshold: o.breaker, BreakerCooldown: 300 * time.Millisecond, Metrics: m, Events: ev,
+		}
+		if o.providerRate > 0 {
+			cfg.ProviderLimiter = ratelimit.NewRedis(rdb, "ratelimit:provider", o.providerRate, log)
+		}
+		if o.redisLimit {
+			cfg.NewLimiter = func(c domain.Channel) Limiter {
+				return ratelimit.NewRedis(rdb, "ratelimit:"+string(c), o.rate, log)
+			}
+		}
+		pools = append(pools, NewPool(store, q, senders, cfg, log))
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &system{sent: sender, t: t, repo: repo, provider: fp, cancel: cancel, done: make(chan struct{}), attempts: o.maxAttempt, metrics: m, events: ev}
 	go disp.Run(ctx)
-	go func() { workers.Run(ctx); close(s.done) }()
+	go func() {
+		var wg sync.WaitGroup
+		for _, p := range pools {
+			wg.Add(1)
+			go func() { defer wg.Done(); p.Run(ctx) }()
+		}
+		wg.Wait()
+		close(s.done)
+	}()
 	t.Cleanup(s.stop)
 	return s
 }
@@ -450,6 +477,67 @@ func TestRateLimitHoldsAfterIdle(t *testing.T) {
 	s.waitFor(ids, 10*time.Second)
 	elapsed := time.Since(begin)
 
+	worst := s.busiestSecond()
+	t.Logf("150 messages at %d/s took %s; busiest one-second window: %d requests", limit, elapsed.Round(time.Millisecond), worst)
+	// The bucket guarantees at most limit+1 tokens (burst 1) per second of
+	// its own schedule. Wall-clock times add timer wake-up delays, which are
+	// never early but can be tens of milliseconds late on a loaded machine
+	// with the race detector: a late request at a window's start shifts the
+	// window and lets one or two more in at its end.
+	const schedulerAllowance = 2
+	if worst > limit+1+schedulerAllowance {
+		t.Fatalf("rate limit exceeded: %d requests in one second", worst)
+	}
+}
+
+// Two worker processes share one limit through Redis. With the in-process
+// limiter each would get its own and together they would send twice the rate.
+func TestRateLimitHoldsAcrossWorkerProcesses(t *testing.T) {
+	const limit = 50
+	s := start(t, options{rate: limit, workers: 10, processes: 2, redisLimit: true, slowClaims: true})
+	ids := s.create(domain.ChannelSMS, 150)
+
+	begin := time.Now()
+	s.waitFor(ids, 10*time.Second)
+	worst := s.busiestSecond()
+	t.Logf("150 messages at %d/s over two processes took %s; busiest one-second window: %d requests",
+		limit, time.Since(begin).Round(time.Millisecond), worst)
+	const schedulerAllowance = 2 // see TestRateLimitHoldsAfterIdle
+	if worst > limit+1+schedulerAllowance {
+		t.Fatalf("rate limit exceeded: %d requests in one second", worst)
+	}
+}
+
+// A provider quota holds across all channels and processes together, while
+// each channel alone could send far more.
+func TestProviderLimitCapsAllChannelsTogether(t *testing.T) {
+	const quota = 20
+	s := start(t, options{rate: 100, workers: 5, processes: 2, redisLimit: true, providerRate: quota})
+	var ids []uuid.UUID
+	for _, c := range domain.Channels {
+		ids = append(ids, s.create(c, 25)...)
+	}
+
+	begin := time.Now()
+	sent := s.waitFor(ids, 15*time.Second)
+	worst := s.busiestSecond()
+	t.Logf("75 messages over 3 channels and two processes at a %d/s quota took %s; busiest one-second window: %d requests",
+		quota, time.Since(begin).Round(time.Millisecond), worst)
+	for id, n := range sent {
+		if n.Status != domain.StatusSent {
+			t.Fatalf("%s ended %s", id, n.Status)
+		}
+	}
+	// The channel wait after the provider slot can shift a request by a few
+	// milliseconds, so the quota gets the same small allowance as the channel limit.
+	const schedulerAllowance = 2
+	if worst > quota+1+schedulerAllowance {
+		t.Fatalf("provider quota exceeded: %d requests in one second", worst)
+	}
+}
+
+// busiestSecond is the most provider calls inside any one-second window.
+func (s *system) busiestSecond() int {
 	s.sent.mu.Lock()
 	times := append([]time.Time(nil), s.sent.at...)
 	s.sent.mu.Unlock()
@@ -462,16 +550,7 @@ func TestRateLimitHoldsAfterIdle(t *testing.T) {
 		}
 		worst = max(worst, j-i)
 	}
-	t.Logf("150 messages at %d/s took %s; busiest one-second window: %d requests", limit, elapsed.Round(time.Millisecond), worst)
-	// The bucket guarantees at most limit+1 tokens (burst 1) per second of
-	// its own schedule. Wall-clock times add timer wake-up delays, which are
-	// never early but can be tens of milliseconds late on a loaded machine
-	// with the race detector: a late request at a window's start shifts the
-	// window and lets one or two more in at its end.
-	const schedulerAllowance = 2
-	if worst > limit+1+schedulerAllowance {
-		t.Fatalf("rate limit exceeded: %d requests in one second", worst)
-	}
+	return worst
 }
 
 // On shutdown, a delivery already in flight completes instead of being

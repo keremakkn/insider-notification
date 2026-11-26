@@ -28,6 +28,17 @@ services:
     environment:
       COLLECTOR_OTLP_ENABLED: "true"
 
+  # Stands in for the provider so `docker compose up` works out of the box.
+  # Set PROVIDER_URL in .env to use webhook.site instead; set
+  # MOCK_FAILURE_RATE / MOCK_LATENCY / MOCK_STATUS to stage failures.
+  mockprovider:
+    build: .
+    entrypoint: ["/usr/local/bin/mockprovider"]
+    environment:
+      MOCK_FAILURE_RATE: ${MOCK_FAILURE_RATE:-0}
+      MOCK_LATENCY: ${MOCK_LATENCY:-50ms}
+      MOCK_STATUS: ${MOCK_STATUS:-0}
+
   migrate:
     image: migrate/migrate:v4.17.1
     volumes: [./migrations:/migrations:ro]
@@ -53,7 +64,9 @@ services:
     build: .
     entrypoint: ["/usr/local/bin/worker"]
     env_file: [{ path: .env, required: false }]
-    environment: *app-env
+    environment:
+      <<: *app-env
+      PROVIDER_URL: ${PROVIDER_URL:-http://mockprovider:8090/send}
     ports: ["9091:9091"]
     depends_on: *app-deps
 

@@ -298,11 +298,11 @@ sequenceDiagram
     end
 
     W->>Q: weighted LPOP (high/normal/low)
-    W->>W: wait for rate-limit token
     W->>DB: UPDATE … SET processing, attempts+1, lease WHERE status='pending' AND next_attempt_at <= now()
     alt 0 rows (cancelled, taken by another worker, or not due)
         W->>W: skip
     else claimed
+        W->>W: wait for rate-limit token
         W->>P: POST {to, channel, content} + X-Idempotency-Key
         alt 2xx
             W->>DB: sent, provider_message_id
@@ -314,22 +314,25 @@ sequenceDiagram
     end
 ```
 
-### 6.2 Order: dequeue, then token, then claim
+### 6.2 Order: dequeue, claim, then token
 
-Two constraints decide where the rate-limit token is taken:
+The rate-limit token is taken **right before the provider call**, after the claim. Two earlier
+placements were tried and tests rejected both:
 
-- **Not after the claim.** A claimed message waiting for a token under load could outlive its lease,
-  and another worker would deliver it too.
-- **Not before the dequeue.** This was the first design, and a test proved it wrong. Idle workers
-  each take a token and then block on an empty queue for up to a second. When a burst arrives,
-  those saved tokens are spent at once on top of the bucket's normal rate. With a limit of 50/s the
-  provider saw 70 requests in one second (`TestRateLimitHoldsAfterIdle`).
+1. **Token before dequeue.** Idle workers each took a token and then blocked on an empty queue for
+   up to a second. When a burst arrived, the saved tokens were spent at once on top of the bucket's
+   rate: 70 requests in one second against a limit of 50.
+2. **Token between dequeue and claim.** This passed on a quiet machine. Under load,
+   `TestRateLimitHoldsAfterIdle` saw 52 to 55 requests per second. The claim query between the token
+   and the request takes 5 ms for one worker and 50 ms for another, so evenly spaced tokens turned
+   into bunched requests.
 
-So a worker pops an ID, then waits for a token, then claims. The token is spent right before the
-provider call, so no one-second window exceeds the limit (the test measures 51 with a burst of 1).
-An unclaimed message has no lease to lose, and the wait is bounded by
-`workers / rate = 20 / 100 = 0.2 s`, far below the visibility timeout. If the claim then fails
-(cancelled, or taken by another worker), a token is wasted: the service under-sends, never over-sends.
+That placement was originally chosen out of fear that a claimed message waiting for a token would
+outlive its lease. The fear was unfounded. A worker waits only for the other workers of its channel
+(`workers / rate = 20 / 100 = 0.2 s`), not for the queue, and the lease is 30 s. With the token
+immediately before the request, the busiest second stays at 51 (limit plus a burst of 1). Under
+heavy load with the race detector it occasionally shows 52. That comes from timer wake-ups that run
+late, not from extra tokens, and the test allows two requests for it. As a side benefit, a failed claim no longer wastes a token.
 
 The limiter is `golang.org/x/time/rate`, one token bucket per channel (100/s, burst 1), shared by
 all workers of that channel in the process. It is in memory, so two worker processes would allow

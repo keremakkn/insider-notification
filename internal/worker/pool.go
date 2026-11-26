@@ -117,21 +117,13 @@ func (p *Pool) loop(ctx context.Context, c domain.Channel, limiter *rate.Limiter
 			continue
 		}
 
-		// Token after the pop and right before the claim: a token taken
-		// earlier could be spent seconds later (while blocked on an empty
-		// queue), letting idle workers burst past the limit. The message is
-		// not claimed yet, so no lease runs out while it waits here.
-		if err := limiter.Wait(ctx); err != nil {
-			breaker.Done(ticket, ResultNone)
-			return
-		}
 		// Finish an accepted delivery even during shutdown: abandoning it
 		// mid-request would only cause a resend after the lease expires.
-		breaker.Done(ticket, p.process(context.WithoutCancel(ctx), id))
+		breaker.Done(ticket, p.process(context.WithoutCancel(ctx), id, limiter))
 	}
 }
 
-func (p *Pool) process(ctx context.Context, id uuid.UUID) Result {
+func (p *Pool) process(ctx context.Context, id uuid.UUID, limiter *rate.Limiter) Result {
 	n, ok, err := p.store.Claim(ctx, id, p.cfg.Lease)
 	if err != nil {
 		p.log.Error("claim", "notification_id", id, "error", err)
@@ -145,6 +137,15 @@ func (p *Pool) process(ctx context.Context, id uuid.UUID) Result {
 	}
 	log := p.log.With("notification_id", n.ID, "correlation_id", n.CorrelationID,
 		"channel", n.Channel, "priority", n.Priority.String(), "attempt", n.Attempts)
+
+	// The token is taken here, after the claim and right before the provider
+	// call, so nothing with a variable duration sits between the limiter and
+	// the request. Taken earlier, it would be spent late: while blocked on an
+	// empty queue (idle workers then burst together), or behind a claim
+	// query that takes 5 ms for one worker and 50 ms for another. Waiting
+	// here cannot cost the lease: a worker waits for at most the other
+	// workers of its channel, workers/rate = 20/100 = 0.2 s, against a 30 s lease.
+	_ = limiter.Wait(ctx) // ctx is not cancellable here, so Wait cannot fail
 
 	o, result := p.deliver(ctx, n)
 	p.record(n, o, result)

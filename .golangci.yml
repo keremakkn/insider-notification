@@ -1,0 +1,16 @@
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    - bodyclose   # unclosed HTTP response bodies
+    - errorlint   # comparing errors with == instead of errors.Is/As
+    - misspell
+    - unconvert   # conversions to the type a value already has
+    - gofmt
+
+issues:
+  exclude-rules:
+    # Closing a WebSocket that is already going away has nothing useful to report.
+    - linters: [errcheck]
+      text: "CloseNow"

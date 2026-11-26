@@ -61,7 +61,7 @@ func TestWebSocketSnapshotThenChanges(t *testing.T) {
 	resp.Body.Close()
 
 	ctx := context.Background()
-	c, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(srv.URL, "http")+"/api/v1/ws?notificationId="+n.ID, nil)
+	c, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(srv.URL, "http")+"/api/v1/ws?notificationId="+n.ID, nil) //nolint:bodyclose // on success the connection belongs to c
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,7 +97,7 @@ func TestWebSocketBatchSnapshot(t *testing.T) {
 	_ = json.NewDecoder(resp.Body).Decode(&b)
 	resp.Body.Close()
 
-	c, _, err := websocket.Dial(context.Background(), "ws"+strings.TrimPrefix(srv.URL, "http")+"/api/v1/ws?batchId="+b.BatchID, nil)
+	c, _, err := websocket.Dial(context.Background(), "ws"+strings.TrimPrefix(srv.URL, "http")+"/api/v1/ws?batchId="+b.BatchID, nil) //nolint:bodyclose // on success the connection belongs to c
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,6 +115,9 @@ func TestWebSocketRejectsBadTargetsBeforeUpgrading(t *testing.T) {
 		"/api/v1/ws?notificationId=" + uuid.NewString(): http.StatusNotFound,
 	} {
 		_, resp, err := websocket.Dial(context.Background(), "ws"+strings.TrimPrefix(srv.URL, "http")+path, nil)
+		if resp != nil {
+			resp.Body.Close()
+		}
 		if err == nil || resp == nil || resp.StatusCode != code {
 			t.Errorf("%s: want HTTP %d, got %v", path, code, resp)
 		}
@@ -132,6 +135,9 @@ func TestWebSocketRejectsForeignBrowserOrigins(t *testing.T) {
 	h := http.Header{"Origin": []string{"https://evil.example"}}
 	_, resp, err := websocket.Dial(context.Background(), "ws"+strings.TrimPrefix(srv.URL, "http")+"/api/v1/ws?notificationId="+n.ID.String(),
 		&websocket.DialOptions{HTTPHeader: h})
+	if resp != nil {
+		defer resp.Body.Close()
+	}
 	if err == nil || resp == nil || resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("a page on another site must not open the stream: %v", resp)
 	}

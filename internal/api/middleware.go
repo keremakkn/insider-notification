@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"regexp"
@@ -89,8 +90,8 @@ func recoverer(log *slog.Logger) func(http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			defer func() {
 				if p := recover(); p != nil {
-					if p == http.ErrAbortHandler {
-						panic(p)
+					if err, ok := p.(error); ok && errors.Is(err, http.ErrAbortHandler) {
+						panic(p) // net/http's way to abort a response; let it through
 					}
 					log.ErrorContext(r.Context(), "panic in handler",
 						"correlation_id", CorrelationIDFrom(r.Context()), "panic", p)

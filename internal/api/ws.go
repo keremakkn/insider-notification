@@ -54,7 +54,7 @@ func (h *handlers) websocket(w http.ResponseWriter, r *http.Request) {
 
 	// The HTTP server's read and write timeouts are meant for short
 	// requests; a WebSocket lives as long as the client wants.
-	rc := http.NewResponseController(w)
+	rc := http.NewResponseController(w) //nolint:bodyclose // controls the writer; there is no response body here
 	_ = rc.SetReadDeadline(time.Time{})
 	_ = rc.SetWriteDeadline(time.Time{})
 

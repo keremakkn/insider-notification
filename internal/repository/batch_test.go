@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -114,7 +115,7 @@ func TestCreateBatchWithNothingAcceptedStoresNothing(t *testing.T) {
 	if b.ID != uuid.Nil {
 		t.Fatal("no batch should be returned")
 	}
-	if _, err := repo.GetBatch(ctx, id); err != domain.ErrNotFound {
+	if _, err := repo.GetBatch(ctx, id); !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("batch row should have been rolled back, got %v", err)
 	}
 }

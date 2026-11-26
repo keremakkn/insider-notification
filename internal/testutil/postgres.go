@@ -52,8 +52,11 @@ func StartPostgres(ctx context.Context) (*pgxpool.Pool, func(), error) {
 func migrate(ctx context.Context, pool *pgxpool.Pool) error {
 	_, here, _, _ := runtime.Caller(0)
 	files, err := filepath.Glob(filepath.Join(filepath.Dir(here), "..", "..", "migrations", "*.up.sql"))
-	if err != nil || len(files) == 0 {
-		return fmt.Errorf("find migrations: %v", err)
+	if err != nil {
+		return fmt.Errorf("find migrations: %w", err)
+	}
+	if len(files) == 0 {
+		return fmt.Errorf("no migrations found next to %s", here)
 	}
 	sort.Strings(files)
 

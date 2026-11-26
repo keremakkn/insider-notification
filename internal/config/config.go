@@ -35,6 +35,9 @@ type Config struct {
 	RetryBase   time.Duration
 	RetryCap    time.Duration
 	MaxAttempts int
+
+	BreakerThreshold int
+	BreakerCooldown  time.Duration
 }
 
 // Load reads the configuration from the environment, applies defaults and validates it.
@@ -65,6 +68,9 @@ func load(getenv func(string) string) (Config, error) {
 		RetryBase:   p.duration("RETRY_BASE", time.Second),
 		RetryCap:    p.duration("RETRY_CAP", 5*time.Minute),
 		MaxAttempts: p.int("MAX_ATTEMPTS", 5),
+
+		BreakerThreshold: p.int("BREAKER_THRESHOLD", 5),
+		BreakerCooldown:  p.duration("BREAKER_COOLDOWN", 30*time.Second),
 	}
 	if err := errors.Join(p.errs...); err != nil {
 		return Config{}, err
@@ -97,6 +103,7 @@ func (c Config) validate() error {
 		"RATE_LIMIT_PER_CHANNEL": c.RateLimitPerChannel,
 		"WORKERS_PER_CHANNEL":    c.WorkersPerChannel,
 		"MAX_ATTEMPTS":           c.MaxAttempts,
+		"BREAKER_THRESHOLD":      c.BreakerThreshold,
 	}
 	for name, v := range positive {
 		if v <= 0 {

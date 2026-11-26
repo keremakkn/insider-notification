@@ -413,9 +413,32 @@ flowchart TD
 Failed notifications keep their full history in `delivery_attempts`, so they act as a dead-letter
 record that can be inspected or re-driven.
 
-**Circuit breaker (failure handling bonus):** after N consecutive failures on a channel, the
-breaker opens and the workers of that channel pause for a cool-down. Then one probe request is let
-through. This avoids burning retries against a provider that is down.
+`Retry-After` is bounded to one hour, so a broken header cannot park a notification for days.
+A shorter `Retry-After` does not shorten our own backoff.
+
+### Circuit breaker (failure handling bonus)
+
+Each channel has a breaker with three states:
+
+```mermaid
+stateDiagram-v2
+    [*] --> closed
+    closed --> open: 5 consecutive provider failures
+    open --> half_open: 30 s cool-down over
+    half_open --> closed: probe succeeds
+    half_open --> open: probe fails
+```
+
+- **What counts as a failure:** 5xx, 429, timeouts and connection errors, meaning the provider is
+  struggling. A 400 does not count: the provider answered, and the message is the problem.
+- **Open:** the channel's workers stop popping. Messages wait in Redis and PostgreSQL **with their
+  attempts untouched**, so an outage longer than the retry budget does not fail them all.
+- **Half-open:** exactly one probe goes through, however many workers are waiting. A worker that
+  started before the breaker opened cannot close it with a late success: only the probe decides.
+
+`TestBreakerShieldsAProviderThatIsDown` runs 30 messages through a 1.5 s outage. Without the
+breaker the provider received 153 requests and each message spent about five of its attempts. With
+it the provider received 11, and every message was delivered once the provider came back.
 
 ## 8. Listing: keyset pagination
 
@@ -518,6 +541,7 @@ GitHub Actions on every push and pull request:
 | `LEASE_DURATION` | 30s |
 | `PROVIDER_TIMEOUT` | 5s |
 | `RETRY_BASE`, `RETRY_CAP`, `MAX_ATTEMPTS` | 1s, 5m, 5 |
+| `BREAKER_THRESHOLD`, `BREAKER_COOLDOWN` | 5, 30s |
 | `PROVIDER_URL` | webhook.site URL |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Jaeger collector |
 

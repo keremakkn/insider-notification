@@ -30,20 +30,38 @@ type Config struct {
 	WorkersPerChannel int
 	RatePerSecond     int           // per channel
 	Lease             time.Duration // must outlive the provider timeout
-	RetryDelay        time.Duration // wait before a retryable failure is tried again
+	Backoff           Backoff       // wait before a retryable failure is tried again
+	BreakerThreshold  int           // consecutive provider failures that open a channel's breaker
+	BreakerCooldown   time.Duration // how long it stays open before one probe
 }
 
 type Pool struct {
-	store   Store
-	queue   Queue
-	senders map[domain.Channel]provider.Sender
-	cfg     Config
-	log     *slog.Logger
+	store    Store
+	queue    Queue
+	senders  map[domain.Channel]provider.Sender
+	breakers map[domain.Channel]*Breaker
+	cfg      Config
+	log      *slog.Logger
 }
 
 func NewPool(store Store, queue Queue, senders map[domain.Channel]provider.Sender, cfg Config, log *slog.Logger) *Pool {
-	return &Pool{store: store, queue: queue, senders: senders, cfg: cfg, log: log.With("component", "worker")}
+	p := &Pool{store: store, queue: queue, senders: senders, cfg: cfg, log: log.With("component", "worker"),
+		breakers: map[domain.Channel]*Breaker{}}
+	for _, c := range domain.Channels {
+		c := c
+		p.breakers[c] = NewBreaker(cfg.BreakerThreshold, cfg.BreakerCooldown, func(from, to BreakerState) {
+			level := slog.LevelInfo
+			if to == BreakerOpen {
+				level = slog.LevelWarn
+			}
+			p.log.Log(context.Background(), level, "circuit breaker "+string(to), "channel", c, "from", from)
+		})
+	}
+	return p
 }
+
+// Breaker exposes a channel's breaker, for health and metrics.
+func (p *Pool) Breaker(c domain.Channel) *Breaker { return p.breakers[c] }
 
 // Run starts every channel's workers and returns when ctx is cancelled and
 // all in-flight deliveries have finished.
@@ -57,28 +75,37 @@ func (p *Pool) Run(ctx context.Context) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				p.loop(ctx, c, limiter)
+				p.loop(ctx, c, limiter, p.breakers[c])
 			}()
 		}
 	}
 	wg.Wait()
 }
 
-func (p *Pool) loop(ctx context.Context, c domain.Channel, limiter *rate.Limiter) {
+func (p *Pool) loop(ctx context.Context, c domain.Channel, limiter *rate.Limiter, breaker *Breaker) {
 	for ctx.Err() == nil {
+		// While the breaker is open, leave messages where they are: in Redis
+		// and PostgreSQL, with their attempts untouched.
+		ticket, ok, wait := breaker.Allow()
+		if !ok {
+			sleep(ctx, min(wait, time.Second))
+			continue
+		}
+
 		id, _, ok, err := p.queue.Pop(ctx, c)
 		if ctx.Err() != nil {
 			// Shutting down. A popped but unclaimed ID is not lost: the
 			// dispatcher re-queues it after the visibility timeout.
+			breaker.Done(ticket, ResultNone)
 			return
 		}
-		if err != nil {
-			p.log.Error("pop", "channel", c, "error", err)
-			sleep(ctx, time.Second) // Redis is struggling; do not spin
+		if err != nil || !ok {
+			breaker.Done(ticket, ResultNone)
+			if err != nil {
+				p.log.Error("pop", "channel", c, "error", err)
+				sleep(ctx, time.Second) // Redis is struggling; do not spin
+			}
 			continue
-		}
-		if !ok {
-			continue // nothing arrived within the blocking timeout
 		}
 
 		// Token after the pop and right before the claim: a token taken
@@ -86,39 +113,40 @@ func (p *Pool) loop(ctx context.Context, c domain.Channel, limiter *rate.Limiter
 		// queue), letting idle workers burst past the limit. The message is
 		// not claimed yet, so no lease runs out while it waits here.
 		if err := limiter.Wait(ctx); err != nil {
+			breaker.Done(ticket, ResultNone)
 			return
 		}
 		// Finish an accepted delivery even during shutdown: abandoning it
 		// mid-request would only cause a resend after the lease expires.
-		p.process(context.WithoutCancel(ctx), c, id)
+		breaker.Done(ticket, p.process(context.WithoutCancel(ctx), id))
 	}
 }
 
-func (p *Pool) process(ctx context.Context, c domain.Channel, id uuid.UUID) {
+func (p *Pool) process(ctx context.Context, id uuid.UUID) Result {
 	n, ok, err := p.store.Claim(ctx, id, p.cfg.Lease)
 	if err != nil {
 		p.log.Error("claim", "notification_id", id, "error", err)
-		return
+		return ResultNone
 	}
 	if !ok {
 		// Cancelled, taken by another worker, finished, or a stale copy
 		// whose next attempt is not due yet.
 		p.log.Debug("skipped", "notification_id", id)
-		return
+		return ResultNone
 	}
 	log := p.log.With("notification_id", n.ID, "correlation_id", n.CorrelationID,
 		"channel", n.Channel, "priority", n.Priority.String(), "attempt", n.Attempts)
 
-	o := p.deliver(ctx, n)
+	o, result := p.deliver(ctx, n)
 	err = p.store.Finish(ctx, n.ID, n.Attempts, o)
 	switch {
 	case errors.Is(err, domain.ErrLeaseLost):
 		log.Warn("lease lost before the result was saved; another worker owns this notification now")
-		return
+		return result
 	case err != nil:
 		// The lease will expire and the notification will be tried again.
 		log.Error("save outcome", "error", err)
-		return
+		return result
 	}
 
 	attrs := []any{"status", o.Status, "duration_ms", o.Duration.Milliseconds()}
@@ -133,13 +161,15 @@ func (p *Pool) process(ctx context.Context, c domain.Channel, id uuid.UUID) {
 	default:
 		log.Error("delivery failed permanently", append(attrs, "error", o.Error)...)
 	}
+	return result
 }
 
-// deliver calls the provider and turns its answer into an outcome.
-func (p *Pool) deliver(ctx context.Context, n domain.Notification) domain.Outcome {
+// deliver calls the provider and turns its answer into an outcome for the
+// notification and a result for the breaker.
+func (p *Pool) deliver(ctx context.Context, n domain.Notification) (domain.Outcome, Result) {
 	sender, ok := p.senders[n.Channel]
 	if !ok {
-		return domain.Outcome{Status: domain.StatusFailed, Error: "no provider configured for channel " + string(n.Channel)}
+		return domain.Outcome{Status: domain.StatusFailed, Error: "no provider configured for channel " + string(n.Channel)}, ResultNone
 	}
 
 	start := time.Now()
@@ -149,7 +179,7 @@ func (p *Pool) deliver(ctx context.Context, n domain.Notification) domain.Outcom
 	o := domain.Outcome{Duration: time.Since(start)}
 	if err == nil {
 		o.Status, o.ProviderMessageID, o.HTTPStatus = domain.StatusSent, res.MessageID, res.StatusCode
-		return o
+		return o, ResultSuccess
 	}
 
 	o.Error = err.Error()
@@ -157,18 +187,20 @@ func (p *Pool) deliver(ctx context.Context, n domain.Notification) domain.Outcom
 	if errors.As(err, &pe) {
 		o.HTTPStatus = pe.StatusCode
 	}
-	retryable := pe != nil && pe.Retryable
-	switch {
-	case !retryable:
+	if pe == nil || !pe.Retryable {
+		// The provider answered and rejected this message: it is up, the
+		// message is the problem. Do not count it against the provider.
 		o.Status = domain.StatusFailed
-	case n.Attempts >= n.MaxAttempts:
+		return o, ResultSuccess
+	}
+	if n.Attempts >= n.MaxAttempts {
 		o.Status = domain.StatusFailed
 		o.Error = "retries exhausted: " + o.Error
-	default:
-		o.Status = domain.StatusPending
-		o.NextAttemptAt = time.Now().Add(p.cfg.RetryDelay)
+		return o, ResultFailure
 	}
-	return o
+	o.Status = domain.StatusPending
+	o.NextAttemptAt = time.Now().Add(p.cfg.Backoff.Delay(n.Attempts, pe.RetryAfter))
+	return o, ResultFailure
 }
 
 func sleep(ctx context.Context, d time.Duration) {

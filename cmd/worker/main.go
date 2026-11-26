@@ -69,7 +69,9 @@ func run() error {
 		WorkersPerChannel: cfg.WorkersPerChannel,
 		RatePerSecond:     cfg.RateLimitPerChannel,
 		Lease:             cfg.LeaseDuration,
-		RetryDelay:        cfg.RetryBase,
+		Backoff:           worker.NewBackoff(cfg.RetryBase, cfg.RetryCap),
+		BreakerThreshold:  cfg.BreakerThreshold,
+		BreakerCooldown:   cfg.BreakerCooldown,
 	}, log)
 
 	log.Info("worker started", "workers_per_channel", cfg.WorkersPerChannel, "rate_per_channel", cfg.RateLimitPerChannel)

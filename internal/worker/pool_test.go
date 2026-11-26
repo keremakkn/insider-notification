@@ -93,6 +93,7 @@ type system struct {
 }
 
 type options struct {
+	breaker    int // consecutive failures that open the breaker; 0 means effectively off
 	rate       int
 	workers    int
 	maxAttempt int
@@ -119,6 +120,9 @@ func start(t *testing.T, o options) *system {
 	if o.maxAttempt == 0 {
 		o.maxAttempt = 5
 	}
+	if o.breaker == 0 {
+		o.breaker = 1_000_000
+	}
 	fp := &fakeProvider{handler: o.handler}
 	srv := httptest.NewServer(fp)
 	t.Cleanup(srv.Close)
@@ -133,7 +137,9 @@ func start(t *testing.T, o options) *system {
 		Interval: 50 * time.Millisecond, Thresholds: [3]int{600, 300, 100}, VisibilityTimeout: 5 * time.Minute,
 	}, log)
 	workers := NewPool(repo, q, senders, Config{
-		WorkersPerChannel: o.workers, RatePerSecond: o.rate, Lease: 10 * time.Second, RetryDelay: 50 * time.Millisecond,
+		WorkersPerChannel: o.workers, RatePerSecond: o.rate, Lease: 10 * time.Second,
+		Backoff:          NewBackoff(25*time.Millisecond, 100*time.Millisecond),
+		BreakerThreshold: o.breaker, BreakerCooldown: 300 * time.Millisecond,
 	}, log)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -319,5 +325,71 @@ func TestShutdownFinishesInFlightDelivery(t *testing.T) {
 	n, _ := s.repo.Get(context.Background(), ids[0])
 	if n.Status != domain.StatusSent {
 		t.Fatalf("in-flight delivery should finish on shutdown, got %s", n.Status)
+	}
+}
+
+// The provider honours Retry-After: the second attempt waits at least as
+// long as the provider asked, far beyond our own 25ms backoff.
+func TestRetryAfterIsHonoured(t *testing.T) {
+	var calls atomic.Int32
+	s := start(t, options{handler: func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) == 1 {
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}})
+	ids := s.create(domain.ChannelSMS, 1)
+	if n := s.waitFor(ids, 5*time.Second)[ids[0]]; n.Status != domain.StatusSent || n.Attempts != 2 {
+		t.Fatalf("want sent on attempt 2, got %s on %d", n.Status, n.Attempts)
+	}
+	s.provider.mu.Lock()
+	gap := s.provider.requests[1].Sub(s.provider.requests[0])
+	s.provider.mu.Unlock()
+	t.Logf("second attempt came %s after the 429", gap.Round(time.Millisecond))
+	if gap < time.Second {
+		t.Fatalf("Retry-After: 1 was ignored, retried after %s", gap)
+	}
+}
+
+// The provider is down for a while. Without a breaker, 30 messages with 10
+// attempts each would hammer it with up to 300 requests. With the breaker
+// the outage costs a handful of requests and no message runs out of
+// attempts; once the provider is back, everything is delivered.
+func TestBreakerShieldsAProviderThatIsDown(t *testing.T) {
+	var (
+		down         atomic.Bool
+		duringOutage atomic.Int32
+	)
+	down.Store(true)
+	s := start(t, options{breaker: 3, maxAttempt: 10, handler: func(w http.ResponseWriter, _ *http.Request) {
+		if down.Load() {
+			duringOutage.Add(1)
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}})
+	ids := s.create(domain.ChannelEmail, 30)
+
+	time.Sleep(1500 * time.Millisecond)
+	down.Store(false)
+	got := s.waitFor(ids, 10*time.Second)
+
+	sent := 0
+	for _, n := range got {
+		if n.Status == domain.StatusSent {
+			sent++
+		}
+	}
+	t.Logf("1.5 s outage: %d provider calls during the outage, %d/30 delivered afterwards", duringOutage.Load(), sent)
+	if sent != 30 {
+		t.Fatalf("every message should survive the outage, %d were delivered", sent)
+	}
+	// Threshold 3, plus requests already in flight when it opened (5
+	// workers), plus about one probe per 300 ms cool-down.
+	if duringOutage.Load() > 20 {
+		t.Fatalf("breaker did not shield the provider: %d calls during the outage", duringOutage.Load())
 	}
 }

@@ -27,7 +27,7 @@ type testServer struct {
 func newTestServer(t *testing.T) *testServer {
 	repo := testutil.NewMemRepo()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return &testServer{t: t, repo: repo, srv: NewRouter(service.NewNotifications(repo, 5), log)}
+	return &testServer{t: t, repo: repo, srv: NewRouter(Options{Service: service.NewNotifications(repo, 5), Log: log})}
 }
 
 func (s *testServer) do(method, path, body string, headers ...string) *httptest.ResponseRecorder {
@@ -231,7 +231,7 @@ func (panicService) Get(context.Context, uuid.UUID) (domain.Notification, error)
 
 func TestPanicBecomes500(t *testing.T) {
 	var logs bytes.Buffer
-	srv := NewRouter(panicService{}, slog.New(slog.NewTextHandler(&logs, nil)))
+	srv := NewRouter(Options{Service: panicService{}, Log: slog.New(slog.NewTextHandler(&logs, nil))})
 	rec := httptest.NewRecorder()
 	srv.ServeHTTP(rec, httptest.NewRequest("GET", "/api/v1/notifications/"+uuid.NewString(), nil))
 

@@ -14,8 +14,12 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/keremakkn/insider-notification/internal/domain"
+	"github.com/keremakkn/insider-notification/internal/health"
+	"github.com/keremakkn/insider-notification/internal/metrics"
 	"github.com/keremakkn/insider-notification/internal/service"
 )
 
@@ -35,16 +39,45 @@ const (
 	maxBatchBodyBytes = 32 << 20 // 32 MiB: 1000 items; very large emails belong in smaller batches
 )
 
+// StatsSource produces the /api/v1/stats snapshot.
+type StatsSource interface {
+	Stats(ctx context.Context, window time.Duration) (domain.Stats, error)
+}
+
+// Options are the router's dependencies. Only Service and Log are required.
+type Options struct {
+	Service  Service
+	Log      *slog.Logger
+	Metrics  *metrics.API        // records request latency and creations
+	Gatherer prometheus.Gatherer // served at /metrics
+	Ready    []health.Check      // checked by /readyz
+	Stats    StatsSource         // served at /api/v1/stats
+}
+
 type handlers struct {
-	svc Service
-	log *slog.Logger
+	svc     Service
+	log     *slog.Logger
+	metrics *metrics.API
+	stats   StatsSource
 }
 
 // NewRouter wires routes and middleware.
-func NewRouter(svc Service, log *slog.Logger) http.Handler {
-	h := &handlers{svc: svc, log: log}
+func NewRouter(o Options) http.Handler {
+	if o.Metrics == nil {
+		o.Metrics = metrics.NewAPI(prometheus.NewRegistry())
+	}
+	h := &handlers{svc: o.Service, log: o.Log, metrics: o.Metrics, stats: o.Stats}
 	r := chi.NewRouter()
-	r.Use(correlationID, requestLogger(log), recoverer(log))
+	r.Use(correlationID, requestLogger(o.Log), observe(o.Metrics), recoverer(o.Log))
+
+	r.Get("/healthz", health.Live)
+	r.Get("/readyz", health.Ready(o.Ready...))
+	if o.Gatherer != nil {
+		r.Handle("/metrics", promhttp.HandlerFor(o.Gatherer, promhttp.HandlerOpts{}))
+	}
+	if o.Stats != nil {
+		r.Get("/api/v1/stats", h.getStats)
+	}
 
 	r.Route("/api/v1/notifications", func(r chi.Router) {
 		r.Post("/", h.create)
@@ -78,6 +111,8 @@ func (h *handlers) create(w http.ResponseWriter, r *http.Request) {
 	status := http.StatusAccepted
 	if !created {
 		status = http.StatusOK
+	} else {
+		h.metrics.Created.WithLabelValues(string(n.Channel), n.Priority.String()).Inc()
 	}
 	w.Header().Set("Location", "/api/v1/notifications/"+n.ID.String())
 	writeJSON(w, status, toResponse(n))
@@ -203,6 +238,9 @@ func (h *handlers) createBatch(w http.ResponseWriter, r *http.Request) {
 			item.ID = it.Notification.ID.String()
 			item.Status = string(it.Notification.Status)
 			item.Duplicate = !it.Created
+			if it.Created {
+				h.metrics.Created.WithLabelValues(string(it.Notification.Channel), it.Notification.Priority.String()).Inc()
+			}
 		}
 		if item.Error != nil {
 			resp.Rejected++

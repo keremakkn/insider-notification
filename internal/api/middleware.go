@@ -5,10 +5,14 @@ import (
 	"log/slog"
 	"net/http"
 	"regexp"
+	"strconv"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/google/uuid"
+
+	"github.com/keremakkn/insider-notification/internal/metrics"
 )
 
 const CorrelationHeader = "X-Correlation-ID"
@@ -37,10 +41,18 @@ func correlationID(next http.Handler) http.Handler {
 	})
 }
 
+// quiet paths are polled by infrastructure every few seconds; logging them
+// would drown the lines that matter.
+var quiet = map[string]bool{"/healthz": true, "/readyz": true, "/metrics": true}
+
 // requestLogger writes one structured line per request.
 func requestLogger(log *slog.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if quiet[r.URL.Path] {
+				next.ServeHTTP(w, r)
+				return
+			}
 			start := time.Now()
 			ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
 			next.ServeHTTP(ww, r)
@@ -76,6 +88,24 @@ func recoverer(log *slog.Logger) func(http.Handler) http.Handler {
 				}
 			}()
 			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// observe records request latency by route pattern (/api/v1/notifications/{id},
+// not the concrete ID), so the number of time series stays bounded.
+func observe(m *metrics.API) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			start := time.Now()
+			ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
+			next.ServeHTTP(ww, r)
+
+			route := "unmatched"
+			if rc := chi.RouteContext(r.Context()); rc != nil && rc.RoutePattern() != "" {
+				route = rc.RoutePattern()
+			}
+			m.Requests.WithLabelValues(r.Method, route, strconv.Itoa(ww.Status())).Observe(time.Since(start).Seconds())
 		})
 	}
 }

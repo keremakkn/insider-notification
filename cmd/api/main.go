@@ -11,8 +11,14 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+
 	"github.com/keremakkn/insider-notification/internal/api"
 	"github.com/keremakkn/insider-notification/internal/config"
+	"github.com/keremakkn/insider-notification/internal/health"
+	"github.com/keremakkn/insider-notification/internal/metrics"
+	"github.com/keremakkn/insider-notification/internal/queue"
 	"github.com/keremakkn/insider-notification/internal/repository"
 	"github.com/keremakkn/insider-notification/internal/service"
 )
@@ -40,10 +46,32 @@ func run() error {
 	}
 	defer db.Close()
 
-	svc := service.NewNotifications(repository.NewNotifications(db), cfg.MaxAttempts)
+	rdb, err := queue.Connect(ctx, cfg.RedisAddr)
+	if err != nil {
+		return err
+	}
+	defer rdb.Close()
+
+	repo := repository.NewNotifications(db)
+	q := queue.New(rdb, cfg.PriorityWeights, time.Second)
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
+	metrics.RegisterQueueDepth(reg, q)
+
+	router := api.NewRouter(api.Options{
+		Service:  service.NewNotifications(repo, cfg.MaxAttempts),
+		Log:      log,
+		Metrics:  metrics.NewAPI(reg),
+		Gatherer: reg,
+		Ready: []health.Check{
+			{Name: "postgres", Ping: db.Ping},
+			{Name: "redis", Ping: func(ctx context.Context) error { return rdb.Ping(ctx).Err() }},
+		},
+		Stats: service.NewStats(repo, q),
+	})
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           api.NewRouter(svc, log),
+		Handler:           router,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      30 * time.Second,

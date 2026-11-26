@@ -17,10 +17,13 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
+	promtest "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/keremakkn/insider-notification/internal/dispatcher"
 	"github.com/keremakkn/insider-notification/internal/domain"
+	"github.com/keremakkn/insider-notification/internal/metrics"
 	"github.com/keremakkn/insider-notification/internal/provider"
 	"github.com/keremakkn/insider-notification/internal/queue"
 	"github.com/keremakkn/insider-notification/internal/repository"
@@ -90,6 +93,7 @@ type system struct {
 	cancel   context.CancelFunc
 	done     chan struct{}
 	attempts int // max attempts for notifications this test creates
+	metrics  *metrics.Delivery
 }
 
 type options struct {
@@ -128,6 +132,7 @@ func start(t *testing.T, o options) *system {
 	t.Cleanup(srv.Close)
 
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	m := metrics.NewDelivery(prometheus.NewRegistry())
 	repo := repository.NewNotifications(pool)
 	q := queue.New(rdb, [3]int{6, 3, 1}, time.Second)
 	sender := provider.NewHTTP(srv.URL, 2*time.Second)
@@ -139,11 +144,11 @@ func start(t *testing.T, o options) *system {
 	workers := NewPool(repo, q, senders, Config{
 		WorkersPerChannel: o.workers, RatePerSecond: o.rate, Lease: 10 * time.Second,
 		Backoff:          NewBackoff(25*time.Millisecond, 100*time.Millisecond),
-		BreakerThreshold: o.breaker, BreakerCooldown: 300 * time.Millisecond,
+		BreakerThreshold: o.breaker, BreakerCooldown: 300 * time.Millisecond, Metrics: m,
 	}, log)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	s := &system{t: t, repo: repo, provider: fp, cancel: cancel, done: make(chan struct{}), attempts: o.maxAttempt}
+	s := &system{t: t, repo: repo, provider: fp, cancel: cancel, done: make(chan struct{}), attempts: o.maxAttempt, metrics: m}
 	go disp.Run(ctx)
 	go func() { workers.Run(ctx); close(s.done) }()
 	t.Cleanup(s.stop)
@@ -216,6 +221,28 @@ func TestDeliversEndToEnd(t *testing.T) {
 		if !keys[id.String()] {
 			t.Fatalf("provider never saw X-Idempotency-Key %s", id)
 		}
+	}
+}
+
+func TestDeliveryMetrics(t *testing.T) {
+	var calls atomic.Int32
+	s := start(t, options{handler: func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) == 1 {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}})
+	ids := s.create(domain.ChannelSMS, 3)
+	s.waitFor(ids, 5*time.Second)
+
+	sent := promtest.ToFloat64(s.metrics.Attempts.WithLabelValues("sms", "sent"))
+	retry := promtest.ToFloat64(s.metrics.Attempts.WithLabelValues("sms", "retry"))
+	if sent != 3 || retry != 1 {
+		t.Fatalf("want 3 sent and 1 retry, got %v and %v", sent, retry)
+	}
+	if n := promtest.CollectAndCount(s.metrics.EndToEnd); n != 1 {
+		t.Fatalf("end-to-end latency should have one series (sms, normal), got %d", n)
 	}
 }
 

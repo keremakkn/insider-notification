@@ -456,15 +456,38 @@ With the index on `(created_at DESC, id DESC)`, every page costs the same.
 
 ## 9. Observability
 
-- **Metrics** (`/metrics`, Prometheus):
-  - queue depth per channel and priority (`LLEN`) and pending backlog per channel (from PostgreSQL)
-  - sent, failed and retried counters per channel
-  - provider latency histogram
-  - end-to-end latency from creation to `sent`
-  - HTTP request duration
-- **Logs**: `log/slog` JSON. Every request gets a correlation ID (from `X-Correlation-ID` or
-  generated). It is stored on the notification, so worker logs for that notification carry the same ID.
-- **Health**: `/healthz` checks that the process is alive. `/readyz` pings PostgreSQL and Redis.
+| Endpoint | Process | For | Content |
+|---|---|---|---|
+| `GET /api/v1/stats?window=5m` | api | people | JSON per channel: queue depth, pending, processing, sent and failed in the window, provider success rate, p50/p95 provider latency and end-to-end latency |
+| `GET /metrics` | api `:8080`, worker `:9091` | Prometheus | Counters and histograms (below) |
+| `GET /healthz` | both | liveness | Always 200 while the process runs. Restarting would not fix a database outage, so no dependency is checked |
+| `GET /readyz` | both | readiness | Pings PostgreSQL and Redis; 503 naming the failing one |
+
+`/metrics` is for machines and `/api/v1/stats` is for people. Prometheus computes rates over time from
+counters, which a person reading raw counters with `curl` cannot do.
+
+Prometheus metrics:
+
+- API:
+  - `http_request_duration_seconds{method, route, status}`. The route label is the pattern
+    (`/api/v1/notifications/{id}`), so the number of series stays bounded.
+  - `notifications_created_total{channel, priority}` (idempotent replays excluded).
+- Worker:
+  - `delivery_attempts_total{channel, outcome}` with outcome `sent`, `retry` or `failed`.
+  - `provider_request_duration_seconds{channel}`.
+  - `notification_delivery_seconds{channel, priority}`: created to sent, including queueing and retries.
+  - `circuit_breaker_state{channel}`: 0 closed, 1 half-open, 2 open.
+  - `dispatcher_enqueued_total`, `dispatcher_leases_recovered_total`, `dispatcher_leases_exhausted_total`.
+- Both: `notification_queue_depth{channel, priority}`, read from Redis at scrape time.
+
+**Logs** are JSON (`log/slog`). Every request gets a correlation ID, taken from `X-Correlation-ID`
+or generated. It is stored on the notification, so worker log lines for that notification carry the
+same ID. Health and metrics requests are not logged.
+
+**Latency of the outbox.** End-to-end latency includes the wait for the next dispatcher tick: up to
+`DISPATCH_INTERVAL` (1 s), about 0.9 s at p50 in a local run against webhook.site. A shorter interval
+trades a few more indexed queries for lower latency. PostgreSQL `LISTEN/NOTIFY` could wake the
+dispatcher on insert and remove the wait almost entirely.
 
 ## 10. Bonus features
 
@@ -543,6 +566,7 @@ GitHub Actions on every push and pull request:
 | `RETRY_BASE`, `RETRY_CAP`, `MAX_ATTEMPTS` | 1s, 5m, 5 |
 | `BREAKER_THRESHOLD`, `BREAKER_COOLDOWN` | 5, 30s |
 | `PROVIDER_URL` | webhook.site URL |
+| `METRICS_ADDR` | :9091 (worker) |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Jaeger collector |
 
 ## 12. Code layout

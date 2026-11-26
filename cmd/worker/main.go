@@ -6,15 +6,22 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
 	"github.com/keremakkn/insider-notification/internal/config"
 	"github.com/keremakkn/insider-notification/internal/dispatcher"
 	"github.com/keremakkn/insider-notification/internal/domain"
+	"github.com/keremakkn/insider-notification/internal/health"
+	"github.com/keremakkn/insider-notification/internal/metrics"
 	"github.com/keremakkn/insider-notification/internal/provider"
 	"github.com/keremakkn/insider-notification/internal/queue"
 	"github.com/keremakkn/insider-notification/internal/repository"
@@ -54,10 +61,15 @@ func run() error {
 
 	repo := repository.NewNotifications(db)
 	q := queue.New(rdb, cfg.PriorityWeights, time.Second)
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
+	m := metrics.NewDelivery(reg)
+	metrics.RegisterQueueDepth(reg, q)
 	disp := dispatcher.New(repo, q, dispatcher.Config{
 		Interval:          cfg.DispatchInterval,
 		Thresholds:        cfg.QueueThresholds,
 		VisibilityTimeout: cfg.VisibilityTimeout,
+		Metrics:           m,
 	}, log)
 
 	// Every channel uses the same provider here; each could get its own.
@@ -72,7 +84,24 @@ func run() error {
 		Backoff:           worker.NewBackoff(cfg.RetryBase, cfg.RetryCap),
 		BreakerThreshold:  cfg.BreakerThreshold,
 		BreakerCooldown:   cfg.BreakerCooldown,
+		Metrics:           m,
 	}, log)
+
+	// The worker serves no API, only probes and metrics for operators.
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
+	mux.HandleFunc("/healthz", health.Live)
+	mux.HandleFunc("/readyz", health.Ready(
+		health.Check{Name: "postgres", Ping: db.Ping},
+		health.Check{Name: "redis", Ping: func(ctx context.Context) error { return rdb.Ping(ctx).Err() }},
+	))
+	ops := &http.Server{Addr: cfg.MetricsAddr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	go func() {
+		if err := ops.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Error("metrics server", "error", err)
+		}
+	}()
+	defer ops.Close()
 
 	log.Info("worker started", "workers_per_channel", cfg.WorkersPerChannel, "rate_per_channel", cfg.RateLimitPerChannel)
 	var wg sync.WaitGroup

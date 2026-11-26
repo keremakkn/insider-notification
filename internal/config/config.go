@@ -16,6 +16,7 @@ const NumPriorities = 3
 
 type Config struct {
 	HTTPAddr    string
+	MetricsAddr string // worker: /metrics and health probes
 	DatabaseURL string
 	RedisAddr   string
 	LogLevel    string
@@ -49,6 +50,7 @@ func load(getenv func(string) string) (Config, error) {
 	p := parser{getenv: getenv}
 	c := Config{
 		HTTPAddr:    p.str("HTTP_ADDR", ":8080"),
+		MetricsAddr: p.str("METRICS_ADDR", ":9091"),
 		DatabaseURL: p.str("DATABASE_URL", "postgres://notifier:notifier@localhost:5432/notifier?sslmode=disable"),
 		RedisAddr:   p.str("REDIS_ADDR", "localhost:6379"),
 		LogLevel:    p.str("LOG_LEVEL", "info"),

@@ -9,8 +9,10 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/keremakkn/insider-notification/internal/domain"
+	"github.com/keremakkn/insider-notification/internal/metrics"
 )
 
 type Store interface {
@@ -27,6 +29,7 @@ type Config struct {
 	Interval          time.Duration
 	Thresholds        [3]int // per priority: high, normal, low
 	VisibilityTimeout time.Duration
+	Metrics           *metrics.Delivery
 }
 
 type Dispatcher struct {
@@ -37,6 +40,9 @@ type Dispatcher struct {
 }
 
 func New(store Store, queue Queue, cfg Config, log *slog.Logger) *Dispatcher {
+	if cfg.Metrics == nil {
+		cfg.Metrics = metrics.NewDelivery(prometheus.NewRegistry())
+	}
 	return &Dispatcher{store: store, queue: queue, cfg: cfg, log: log.With("component", "dispatcher")}
 }
 
@@ -54,6 +60,9 @@ func (d *Dispatcher) Run(ctx context.Context) {
 	defer t.Stop()
 	for {
 		s := d.Tick(ctx)
+		d.cfg.Metrics.Dispatched.Add(float64(s.Dispatched))
+		d.cfg.Metrics.LeasesRecovered.Add(float64(s.Recovered))
+		d.cfg.Metrics.LeasesExhausted.Add(float64(s.Failed))
 		if s.Recovered+s.Failed+s.Dispatched+s.Errors > 0 {
 			d.log.Info("dispatch tick", "dispatched", s.Dispatched, "recovered", s.Recovered, "failed", s.Failed, "errors", s.Errors)
 		}

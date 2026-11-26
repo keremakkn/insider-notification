@@ -46,6 +46,7 @@ services:
     entrypoint: ["/usr/local/bin/worker"]
     env_file: [{ path: .env, required: false }]
     environment: *app-env
+    ports: ["9091:9091"]
     depends_on: *app-deps
 
 volumes:

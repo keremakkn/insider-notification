@@ -11,9 +11,11 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/time/rate"
 
 	"github.com/keremakkn/insider-notification/internal/domain"
+	"github.com/keremakkn/insider-notification/internal/metrics"
 	"github.com/keremakkn/insider-notification/internal/provider"
 )
 
@@ -33,6 +35,7 @@ type Config struct {
 	Backoff           Backoff       // wait before a retryable failure is tried again
 	BreakerThreshold  int           // consecutive provider failures that open a channel's breaker
 	BreakerCooldown   time.Duration // how long it stays open before one probe
+	Metrics           *metrics.Delivery
 }
 
 type Pool struct {
@@ -45,6 +48,9 @@ type Pool struct {
 }
 
 func NewPool(store Store, queue Queue, senders map[domain.Channel]provider.Sender, cfg Config, log *slog.Logger) *Pool {
+	if cfg.Metrics == nil {
+		cfg.Metrics = metrics.NewDelivery(prometheus.NewRegistry())
+	}
 	p := &Pool{store: store, queue: queue, senders: senders, cfg: cfg, log: log.With("component", "worker"),
 		breakers: map[domain.Channel]*Breaker{}}
 	for _, c := range domain.Channels {
@@ -55,10 +61,13 @@ func NewPool(store Store, queue Queue, senders map[domain.Channel]provider.Sende
 				level = slog.LevelWarn
 			}
 			p.log.Log(context.Background(), level, "circuit breaker "+string(to), "channel", c, "from", from)
+			p.cfg.Metrics.BreakerState.WithLabelValues(string(c)).Set(breakerGauge[to])
 		})
 	}
 	return p
 }
+
+var breakerGauge = map[BreakerState]float64{BreakerClosed: 0, BreakerHalfOpen: 1, BreakerOpen: 2}
 
 // Breaker exposes a channel's breaker, for health and metrics.
 func (p *Pool) Breaker(c domain.Channel) *Breaker { return p.breakers[c] }
@@ -138,6 +147,7 @@ func (p *Pool) process(ctx context.Context, id uuid.UUID) Result {
 		"channel", n.Channel, "priority", n.Priority.String(), "attempt", n.Attempts)
 
 	o, result := p.deliver(ctx, n)
+	p.record(n, o, result)
 	err = p.store.Finish(ctx, n.ID, n.Attempts, o)
 	switch {
 	case errors.Is(err, domain.ErrLeaseLost):
@@ -162,6 +172,18 @@ func (p *Pool) process(ctx context.Context, id uuid.UUID) Result {
 		log.Error("delivery failed permanently", append(attrs, "error", o.Error)...)
 	}
 	return result
+}
+
+func (p *Pool) record(n domain.Notification, o domain.Outcome, r Result) {
+	m, ch := p.cfg.Metrics, string(n.Channel)
+	if r != ResultNone {
+		m.ProviderLatency.WithLabelValues(ch).Observe(o.Duration.Seconds())
+	}
+	outcome := map[domain.Status]string{domain.StatusSent: "sent", domain.StatusPending: "retry", domain.StatusFailed: "failed"}[o.Status]
+	m.Attempts.WithLabelValues(ch, outcome).Inc()
+	if o.Status == domain.StatusSent {
+		m.EndToEnd.WithLabelValues(ch, n.Priority.String()).Observe(time.Since(n.CreatedAt).Seconds())
+	}
 }
 
 // deliver calls the provider and turns its answer into an outcome for the

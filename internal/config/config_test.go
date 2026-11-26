@@ -56,8 +56,8 @@ func TestRejectsUnsafeCombinations(t *testing.T) {
 		{"bad duration", map[string]string{"LEASE_DURATION": "30"}, "not a duration"},
 		{"wrong number of weights", map[string]string{"PRIORITY_WEIGHTS": "6,3"}, "want 3"},
 		{"negative provider limit", map[string]string{"PROVIDER_RATE_LIMIT": "-1"}, "PROVIDER_RATE_LIMIT"},
-		// 60 workers queued at 2/s wait 30 s, longer than the 30 s lease.
-		{"provider limit so slow the lease runs out", map[string]string{"PROVIDER_RATE_LIMIT": "2"}, "rate-limit wait"},
+		// 20 workers queued at 1/s wait 20 s; with the 5 s provider timeout that outlasts a 20 s lease.
+		{"channel rate so low the lease runs out", map[string]string{"RATE_LIMIT_PER_CHANNEL": "1", "QUEUE_THRESHOLDS": "6,3,1", "LEASE_DURATION": "20s"}, "rate-limit wait"},
 		{"explicit thresholds too long for a slow provider",
 			map[string]string{"PROVIDER_RATE_LIMIT": "5", "QUEUE_THRESHOLDS": "600,300,100"}, "VISIBILITY_TIMEOUT"},
 	}
@@ -96,8 +96,21 @@ func TestProviderLimitShrinksQueues(t *testing.T) {
 	if got := c.MaxQueueWait(); got != 10*time.Second {
 		t.Fatalf("MaxQueueWait = %s, want 10s", got)
 	}
-	if got := c.MaxLimiterWait(); got != 10*time.Second { // 60 workers at 6/s
-		t.Fatalf("MaxLimiterWait = %s, want 10s", got)
+	// The quota is waited for before the claim, so it does not lengthen
+	// the wait that a lease must cover.
+	if got := c.MaxLimiterWait(); got != 200*time.Millisecond {
+		t.Fatalf("MaxLimiterWait = %s, want 200ms", got)
+	}
+}
+
+// Even a very low quota is safe: waiting for it holds no lease.
+func TestLowProviderLimitIsAccepted(t *testing.T) {
+	c, err := load(env(map[string]string{"PROVIDER_RATE_LIMIT": "1"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.QueueThresholds != [3]int{2, 1, 1} {
+		t.Fatalf("QueueThresholds = %v, want [2 1 1]", c.QueueThresholds)
 	}
 }
 

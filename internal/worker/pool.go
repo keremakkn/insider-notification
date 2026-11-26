@@ -148,6 +148,20 @@ func (p *Pool) loop(ctx context.Context, c domain.Channel, limiter Limiter, brea
 }
 
 func (p *Pool) process(ctx context.Context, id uuid.UUID, limiter Limiter) Result {
+	// The provider quota is waited for before the claim, because that wait
+	// can be long: with a low quota every worker of every process is in
+	// line. Before the claim it holds no lease, so it cannot outlast one;
+	// a lease running out mid-wait would let a second worker claim and send
+	// the same message, and would spend an attempt each time. If the
+	// message is cancelled or taken meanwhile, the claim below fails and
+	// only the slot is wasted.
+	var quotaWait time.Duration
+	if p.cfg.ProviderLimiter != nil {
+		start := time.Now()
+		_ = p.cfg.ProviderLimiter.Wait(ctx) // ctx is not cancellable here and the Redis limiter falls back
+		quotaWait = time.Since(start)
+	}
+
 	n, ok, err := p.store.Claim(ctx, id, p.cfg.Lease)
 	if err != nil {
 		p.log.Error("claim", "notification_id", id, "error", err)
@@ -167,7 +181,8 @@ func (p *Pool) process(ctx context.Context, id uuid.UUID, limiter Limiter) Resul
 	// queue broke the in-process context; the row carried it across.
 	ctx, span := tracing.Tracer().Start(tracing.Extract(ctx, n.TraceParent), "notification.deliver",
 		trace.WithAttributes(attribute.String("notification.id", n.ID.String()),
-			attribute.String("notification.channel", string(n.Channel)), attribute.Int("notification.attempt", n.Attempts)))
+			attribute.String("notification.channel", string(n.Channel)), attribute.Int("notification.attempt", n.Attempts),
+			attribute.Int64("provider_quota.wait_ms", quotaWait.Milliseconds())))
 	defer span.End()
 
 	// The token is taken here, after the claim and right before the provider
@@ -177,19 +192,10 @@ func (p *Pool) process(ctx context.Context, id uuid.UUID, limiter Limiter) Resul
 	// query that takes 5 ms for one worker and 50 ms for another. Waiting
 	// here cannot cost the lease: a worker waits for at most the other
 	// workers of its channel in every process, processes × workers / rate
-	// (2 × 20 / 100 = 0.4 s), against a 30 s lease.
-	//
-	// With a provider quota the provider slot comes first and the channel
-	// slot last, so the channel limit, which the service promises, is the
-	// one enforced exactly at the request. The provider limit is then off by
-	// at most the channel wait, which is near zero whenever the quota is the
-	// tighter of the two.
+	// (2 × 20 / 100 = 0.4 s), against a 30 s lease. (The provider quota,
+	// which can make waits long, was waited for before the claim.)
 	_, wait := tracing.Tracer().Start(ctx, "rate_limit.wait")
-	// ctx is not cancellable here and the Redis limiter falls back, so Wait cannot fail.
-	if p.cfg.ProviderLimiter != nil {
-		_ = p.cfg.ProviderLimiter.Wait(ctx)
-	}
-	_ = limiter.Wait(ctx)
+	_ = limiter.Wait(ctx) // ctx is not cancellable here and the Redis limiter falls back, so Wait cannot fail
 	wait.End()
 
 	o, result := p.deliver(ctx, n)

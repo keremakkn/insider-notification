@@ -56,11 +56,14 @@ flowchart LR
 
 - **PostgreSQL** holds every notification and its state. It is durable and is the only place
   that decides what a notification's status is.
-- **Redis** holds only notification IDs in 9 lists (`queue:{channel}:{priority}`). It is a fast
-  "what to do next" index. If Redis loses its data, the dispatcher rebuilds the queues from
-  PostgreSQL, so nothing is lost.
+- **Redis** holds nothing that is the truth about a notification: IDs in 9 lists
+  (`queue:{channel}:{priority}`), a fast "what to do next" index; the next free send slot of each
+  rate limit (`ratelimit:*`, §6.2); and status events on Pub/Sub for WebSocket clients (§10.2). If
+  Redis loses its data, the dispatcher rebuilds the queues from PostgreSQL and the limiters start
+  over from the current time, so nothing is lost.
 - **Two binaries**, `api` and `worker`, so the HTTP side and the delivery side scale independently.
-  The API never talks to Redis; only the dispatcher writes to the queues.
+  The API uses Redis only for status events (it announces cancellations and relays the rest to
+  WebSocket clients); only the dispatcher writes to the queues.
 
 ## 3. Data model
 
@@ -352,14 +355,22 @@ shared limiter it has 51 to 52.
 **Provider quota.** The channel limit is the service's own rule. A provider can have a stricter one
 that covers all channels together: here all three post to one URL, so they may send it 3 × 100/s.
 `PROVIDER_RATE_LIMIT` adds a second shared limiter (`ratelimit:provider`) that every
-channel and process passes through. The provider slot is taken first and the channel slot last, so
-the channel limit, the one the service promises, stays exact at the request.
-`TestProviderLimitCapsAllChannelsTogether` sends 75 messages over three channels and two processes
-with a 20/s quota: the busiest second has 21 requests (75 without the quota). A lower quota also
-slows draining, so the default `QUEUE_THRESHOLDS` are derived from the real drain rate (10 s of
-work per queue: 600/300/100 at 100/s, 10/5/2 at a 5/s quota), and config rejects a quota so slow
-that a claimed message could outwait its lease (`workers × channels / quota + PROVIDER_TIMEOUT`
-must stay under `LEASE_DURATION`).
+channel and process passes through. `TestProviderLimitCapsAllChannelsTogether` sends 75 messages
+over three channels and two processes with a 20/s quota: the busiest second has 21 requests (75
+without the quota). A lower quota also slows draining, so the default `QUEUE_THRESHOLDS` are derived
+from the real drain rate (10 s of work per queue: 600/300/100 at 100/s, 10/5/2 at a 5/s quota).
+
+The quota is waited for **after the dequeue and before the claim**, unlike the channel slot. With a
+low quota the wait is long, since every worker of every process is in line (3 processes × 60
+workers at 5/s is 36 s). The first version took the quota slot after the claim, next to the
+channel slot, and config checked the wait against the lease, but only for one process.
+`TestProviderQuotaWaitHoldsNoLease` (2/s quota, 500 ms lease) showed what happens when the wait
+outlasts the lease: the lease expires mid-wait, the message is recovered and claimed again, every
+expiry spends an attempt, and a notification ended `failed` without the provider ever rejecting it;
+two workers could also send the same message. Before the claim, the wait holds no lease, so no
+setting of quota, workers or processes can cause that. If the message is cancelled or taken
+meanwhile, the claim fails and only the slot is wasted. The cost is precision: the claim (5 to 50 ms)
+now sits between the quota slot and the request, but the test still sees 21 requests at most.
 
 A free webhook.site URL has a different limit: a total number of requests, after which it answers
 every request with `429` ("Request limit exceeded"). No rate limit avoids that. The service handles

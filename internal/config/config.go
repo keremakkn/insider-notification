@@ -146,16 +146,12 @@ func (c Config) MaxQueueWait() time.Duration {
 	return longest
 }
 
-// MaxLimiterWait is how long a claimed notification can wait for its turn
-// at the provider limit in one worker process: every worker of every
-// channel is ahead of it. Without a provider limit it is the channel's own
-// workers at the channel rate.
+// MaxLimiterWait is how long a claimed notification can wait for its
+// channel's rate limit in one worker process: every other worker of the
+// channel is ahead of it. The provider quota is not part of it, because
+// workers wait for that before they claim (internal/worker).
 func (c Config) MaxLimiterWait() time.Duration {
-	waiting, rate := float64(c.WorkersPerChannel), float64(c.RateLimitPerChannel)
-	if c.ProviderRateLimit > 0 {
-		waiting, rate = float64(NumChannels*c.WorkersPerChannel), min(float64(NumChannels)*rate, float64(c.ProviderRateLimit))
-	}
-	return time.Duration(waiting / rate * float64(time.Second))
+	return time.Duration(float64(c.WorkersPerChannel) / float64(c.RateLimitPerChannel) * float64(time.Second))
 }
 
 // validateRates checks what the derived defaults are computed from, so they
@@ -201,8 +197,8 @@ func (c Config) validate() error {
 		errs = append(errs, fmt.Errorf("LEASE_DURATION (%s) must be longer than PROVIDER_TIMEOUT (%s)",
 			c.LeaseDuration, c.ProviderTimeout))
 	} else if wait := c.MaxLimiterWait(); c.LeaseDuration <= c.ProviderTimeout+wait {
-		// The lease starts at the claim, before the rate-limit wait. A slow
-		// provider limit with many workers could outlast it.
+		// The lease starts at the claim, before the channel's rate-limit
+		// wait. Many workers at a low channel rate could outlast it.
 		errs = append(errs, fmt.Errorf("LEASE_DURATION (%s) must be longer than PROVIDER_TIMEOUT (%s) plus the longest rate-limit wait (%s); lower WORKERS_PER_CHANNEL or raise LEASE_DURATION",
 			c.LeaseDuration, c.ProviderTimeout, wait))
 	}

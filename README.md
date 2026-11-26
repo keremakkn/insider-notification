@@ -138,7 +138,8 @@ flowchart LR
 
 The main decisions are below. [DESIGN.md](docs/DESIGN.md) gives the reasoning for each.
 
-- **PostgreSQL is the source of truth; Redis only holds IDs.** The API writes only to PostgreSQL.
+- **PostgreSQL is the source of truth; Redis holds nothing that cannot be rebuilt.** Queues of IDs,
+  rate-limit slots and status events. The API writes notifications only to PostgreSQL.
   A dispatcher (transactional outbox) moves due rows into Redis. A crash between "stored" and
   "queued" therefore cannot lose a notification, and neither can a Redis restart.
 - **Nothing is lost when a process dies.**

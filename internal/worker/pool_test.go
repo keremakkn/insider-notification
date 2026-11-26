@@ -163,9 +163,10 @@ type options struct {
 	rate         int
 	workers      int
 	maxAttempt   int
-	processes    int  // worker pools running side by side, like worker containers; 0 means 1
-	redisLimit   bool // share the rate limit through Redis instead of per pool
-	providerRate int  // provider quota shared by all channels and pools; 0 means none
+	processes    int           // worker pools running side by side, like worker containers; 0 means 1
+	redisLimit   bool          // share the rate limit through Redis instead of per pool
+	providerRate int           // provider quota shared by all channels and pools; 0 means none
+	lease        time.Duration // 0 means 10 s
 	handler      func(w http.ResponseWriter, r *http.Request)
 }
 
@@ -195,6 +196,9 @@ func start(t *testing.T, o options) *system {
 	if o.processes == 0 {
 		o.processes = 1
 	}
+	if o.lease == 0 {
+		o.lease = 10 * time.Second
+	}
 	fp := &fakeProvider{handler: o.handler}
 	srv := httptest.NewServer(fp)
 	t.Cleanup(srv.Close)
@@ -217,7 +221,7 @@ func start(t *testing.T, o options) *system {
 	var pools []*Pool
 	for range o.processes {
 		cfg := Config{
-			WorkersPerChannel: o.workers, RatePerSecond: o.rate, Lease: 10 * time.Second,
+			WorkersPerChannel: o.workers, RatePerSecond: o.rate, Lease: o.lease,
 			Backoff:          NewBackoff(25*time.Millisecond, 100*time.Millisecond),
 			BreakerThreshold: o.breaker, BreakerCooldown: 300 * time.Millisecond, Metrics: m, Events: ev,
 		}
@@ -533,6 +537,36 @@ func TestProviderLimitCapsAllChannelsTogether(t *testing.T) {
 	const schedulerAllowance = 2
 	if worst > quota+1+schedulerAllowance {
 		t.Fatalf("provider quota exceeded: %d requests in one second", worst)
+	}
+}
+
+// Waiting for the provider quota must not hold a lease. Three workers at a
+// 2/s quota queue up for 0, 0.5 and 1 s; with a 500 ms lease, a worker that
+// claimed first and waited second would lose its lease mid-wait, another
+// worker would claim the message again, and both would send it.
+func TestProviderQuotaWaitHoldsNoLease(t *testing.T) {
+	s := start(t, options{workers: 3, providerRate: 2, lease: 500 * time.Millisecond})
+	ids := s.create(domain.ChannelSMS, 6)
+	for id, n := range s.waitFor(ids, 15*time.Second) {
+		if n.Status != domain.StatusSent {
+			t.Fatalf("%s ended %s", id, n.Status)
+		}
+	}
+	time.Sleep(time.Second) // a duplicate still waiting for its slot would arrive now
+
+	s.provider.mu.Lock()
+	defer s.provider.mu.Unlock()
+	seen := map[string]int{}
+	for _, k := range s.provider.keys {
+		seen[k]++
+	}
+	for k, n := range seen {
+		if n > 1 {
+			t.Errorf("notification %s reached the provider %d times", k, n)
+		}
+	}
+	if len(s.provider.keys) != len(ids) {
+		t.Fatalf("provider got %d requests for %d notifications", len(s.provider.keys), len(ids))
 	}
 }
 

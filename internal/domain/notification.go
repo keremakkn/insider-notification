@@ -74,10 +74,11 @@ type Notification struct {
 	RequestHash    string // empty exactly when IdempotencyKey is empty
 	CorrelationID  string
 
-	Recipient string
-	Channel   Channel
-	Content   string
-	Priority  Priority
+	Recipient  string
+	Channel    Channel
+	Content    string // for a template, the rendered text
+	Priority   Priority
+	TemplateID *uuid.UUID // set when Content was rendered from a template
 
 	Status      Status
 	Attempts    int
@@ -104,6 +105,12 @@ type CreateRequest struct {
 	Priority       string
 	ScheduledAt    *time.Time
 	IdempotencyKey string
+
+	// A request may name a template instead of sending content. The service
+	// renders it into Content before calling NewNotification, so content
+	// rules (such as the SMS length) apply to the final text.
+	TemplateID *uuid.UUID
+	Variables  map[string]string
 }
 
 const maxIdempotencyKeyLen = 255
@@ -161,10 +168,34 @@ func NewNotification(req CreateRequest, maxAttempts int, now time.Time) (Notific
 		n.ScheduledAt = &at
 		n.NextAttemptAt = at
 	}
+	if req.TemplateID != nil {
+		tid := *req.TemplateID
+		n.TemplateID = &tid
+	}
 	if n.IdempotencyKey != "" {
 		n.RequestHash = RequestHash(n)
+		if req.TemplateID != nil {
+			// Hash what the client sent (template and values), not the
+			// rendered text: if the template is edited and the client replays
+			// the identical request, it must get its original notification
+			// back, not a 422 for "different content".
+			n.RequestHash = hash(n.Recipient, string(n.Channel), "template:"+req.TemplateID.String(),
+				canonical(req.Variables), n.Priority.String(), scheduledString(n.ScheduledAt))
+		}
 	}
 	return n, nil
+}
+
+func canonical(vars map[string]string) string {
+	b, _ := json.Marshal(vars) // encoding/json sorts map keys
+	return string(b)
+}
+
+func scheduledString(t *time.Time) string {
+	if t == nil {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339Nano)
 }
 
 // RequestHash fingerprints the fields a client controls. The same
@@ -172,11 +203,11 @@ func NewNotification(req CreateRequest, maxAttempts int, now time.Time) (Notific
 // different request. JSON gives an unambiguous encoding: "ab"+"c" and
 // "a"+"bc" hash differently.
 func RequestHash(n Notification) string {
-	var scheduled string
-	if n.ScheduledAt != nil {
-		scheduled = n.ScheduledAt.UTC().Format(time.RFC3339Nano)
-	}
-	b, _ := json.Marshal([]string{n.Recipient, string(n.Channel), n.Content, n.Priority.String(), scheduled})
+	return hash(n.Recipient, string(n.Channel), n.Content, n.Priority.String(), scheduledString(n.ScheduledAt))
+}
+
+func hash(fields ...string) string {
+	b, _ := json.Marshal(fields)
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
 }

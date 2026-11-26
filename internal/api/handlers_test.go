@@ -27,7 +27,7 @@ type testServer struct {
 func newTestServer(t *testing.T) *testServer {
 	repo := testutil.NewMemRepo()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return &testServer{t: t, repo: repo, srv: NewRouter(Options{Service: service.NewNotifications(repo, 5), Log: log})}
+	return &testServer{t: t, repo: repo, srv: NewRouter(Options{Service: service.NewNotifications(repo, testutil.NewMemTemplates(), 5), Log: log})}
 }
 
 func (s *testServer) do(method, path, body string, headers ...string) *httptest.ResponseRecorder {

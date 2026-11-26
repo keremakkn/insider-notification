@@ -79,7 +79,7 @@ func migrate(ctx context.Context, pool *pgxpool.Pool) error {
 func Truncate(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
 	if _, err := pool.Exec(context.Background(),
-		`TRUNCATE delivery_attempts, notifications, batches RESTART IDENTITY CASCADE`); err != nil {
+		`TRUNCATE delivery_attempts, notifications, batches, templates RESTART IDENTITY CASCADE`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 }

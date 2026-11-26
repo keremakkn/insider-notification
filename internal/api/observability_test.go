@@ -33,7 +33,7 @@ func observedServer(t *testing.T, ready ...health.Check) (http.Handler, *prometh
 	sms := &domain.ChannelStats{QueueDepth: map[domain.Priority]int{domain.PriorityHigh: 12}, Pending: 40,
 		AttemptsOK: 98, AttemptsFailed: 2, Sent: 95, ProviderP50: 80 * time.Millisecond, EndToEndP95: 1500 * time.Millisecond}
 	srv := NewRouter(Options{
-		Service:  service.NewNotifications(testutil.NewMemRepo(), 5),
+		Service:  service.NewNotifications(testutil.NewMemRepo(), testutil.NewMemTemplates(), 5),
 		Log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Metrics:  metrics.NewAPI(reg),
 		Gatherer: reg,

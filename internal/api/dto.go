@@ -3,20 +3,33 @@ package api
 import (
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/keremakkn/insider-notification/internal/domain"
 )
 
 type createRequest struct {
-	Recipient   string     `json:"recipient"`
-	Channel     string     `json:"channel"`
-	Content     string     `json:"content"`
-	Priority    string     `json:"priority"`
-	ScheduledAt *time.Time `json:"scheduledAt"`
+	Recipient   string            `json:"recipient"`
+	Channel     string            `json:"channel"`
+	Content     string            `json:"content"`
+	Priority    string            `json:"priority"`
+	ScheduledAt *time.Time        `json:"scheduledAt"`
+	TemplateID  *uuid.UUID        `json:"templateId"`
+	Variables   map[string]string `json:"variables"`
+}
+
+func (c createRequest) toDomain(idempotencyKey string) domain.CreateRequest {
+	return domain.CreateRequest{
+		Recipient: c.Recipient, Channel: c.Channel, Content: c.Content, Priority: c.Priority,
+		ScheduledAt: c.ScheduledAt, IdempotencyKey: idempotencyKey,
+		TemplateID: c.TemplateID, Variables: c.Variables,
+	}
 }
 
 type notificationResponse struct {
 	ID                string     `json:"id"`
 	BatchID           string     `json:"batchId,omitempty"`
+	TemplateID        string     `json:"templateId,omitempty"`
 	Recipient         string     `json:"recipient"`
 	Channel           string     `json:"channel"`
 	Content           string     `json:"content"`
@@ -54,6 +67,9 @@ func toResponse(n domain.Notification) notificationResponse {
 	}
 	if n.BatchID != nil {
 		r.BatchID = n.BatchID.String()
+	}
+	if n.TemplateID != nil {
+		r.TemplateID = n.TemplateID.String()
 	}
 	// Only meaningful while the notification can still be attempted.
 	if n.Status == domain.StatusPending {
@@ -128,4 +144,33 @@ func toBatchSummary(s domain.BatchSummary) batchSummaryResponse {
 		ID: s.ID.String(), Total: s.Total, Accepted: s.Accepted, Rejected: s.Rejected,
 		StatusCounts: counts, CreatedAt: s.CreatedAt,
 	}
+}
+
+type templateRequest struct {
+	Name    string `json:"name"`
+	Channel string `json:"channel"`
+	Body    string `json:"body"`
+}
+
+type templateUpdateRequest struct {
+	Body string `json:"body"`
+}
+
+type templateResponse struct {
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	Channel   string    `json:"channel"`
+	Body      string    `json:"body"`
+	Variables []string  `json:"variables"`
+	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+
+func toTemplateResponse(t domain.Template) templateResponse {
+	vars := t.Variables()
+	if vars == nil {
+		vars = []string{}
+	}
+	return templateResponse{ID: t.ID.String(), Name: t.Name, Channel: string(t.Channel), Body: t.Body,
+		Variables: vars, CreatedAt: t.CreatedAt, UpdatedAt: t.UpdatedAt}
 }

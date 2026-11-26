@@ -58,11 +58,13 @@ func run() error {
 	reg.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	metrics.RegisterQueueDepth(reg, q)
 
+	templates := repository.NewTemplates(db)
 	router := api.NewRouter(api.Options{
-		Service:  service.NewNotifications(repo, cfg.MaxAttempts),
-		Log:      log,
-		Metrics:  metrics.NewAPI(reg),
-		Gatherer: reg,
+		Service:   service.NewNotifications(repo, templates, cfg.MaxAttempts),
+		Templates: service.NewTemplates(templates),
+		Log:       log,
+		Metrics:   metrics.NewAPI(reg),
+		Gatherer:  reg,
 		Ready: []health.Check{
 			{Name: "postgres", Ping: db.Ping},
 			{Name: "redis", Ping: func(ctx context.Context) error { return rdb.Ping(ctx).Err() }},

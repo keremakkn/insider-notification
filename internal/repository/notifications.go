@@ -22,7 +22,7 @@ func NewNotifications(db *pgxpool.Pool) *Notifications {
 }
 
 const columns = `id, batch_id, idempotency_key, request_hash, correlation_id,
-	recipient, channel, content, priority,
+	recipient, channel, content, priority, template_id,
 	status, attempts, max_attempts,
 	next_attempt_at, scheduled_at, enqueued_at, lease_expires_at,
 	provider_message_id, last_error,
@@ -54,16 +54,16 @@ func (r *Notifications) Create(ctx context.Context, n domain.Notification) (stor
 const insertSQL = `
 	INSERT INTO notifications (
 		id, batch_id, idempotency_key, request_hash, correlation_id,
-		recipient, channel, content, priority,
+		recipient, channel, content, priority, template_id,
 		status, max_attempts, next_attempt_at, scheduled_at, created_at, updated_at)
-	VALUES ($1, $2, NULLIF($3, ''), NULLIF($4, ''), $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $14)
+	VALUES ($1, $2, NULLIF($3, ''), NULLIF($4, ''), $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $15)
 	ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
 	RETURNING ` + columns
 
 func insertArgs(n domain.Notification) []any {
 	return []any{
 		n.ID, n.BatchID, n.IdempotencyKey, n.RequestHash, n.CorrelationID,
-		n.Recipient, string(n.Channel), n.Content, int16(n.Priority),
+		n.Recipient, string(n.Channel), n.Content, int16(n.Priority), n.TemplateID,
 		string(n.Status), n.MaxAttempts, n.NextAttemptAt, n.ScheduledAt, n.CreatedAt,
 	}
 }
@@ -296,7 +296,7 @@ func scan(row pgx.Row) (domain.Notification, error) {
 	)
 	err := row.Scan(
 		&n.ID, &n.BatchID, &idemKey, &reqHash, &n.CorrelationID,
-		&n.Recipient, &channel, &n.Content, &priority,
+		&n.Recipient, &channel, &n.Content, &priority, &n.TemplateID,
 		&status, &n.Attempts, &n.MaxAttempts,
 		&n.NextAttemptAt, &n.ScheduledAt, &n.EnqueuedAt, &n.LeaseExpiresAt,
 		&providerID, &lastErr,

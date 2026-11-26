@@ -143,8 +143,10 @@ stateDiagram-v2
 | `GET` | `/api/v1/batches/{id}` | Batch summary: counts per status |
 | `POST` | `/api/v1/notifications/{id}/cancel` | `200` cancelled, `409` already processing or finished, `404` |
 | `GET` | `/api/v1/notifications?status=&channel=&from=&to=&limit=&cursor=` | Filtered list, keyset pagination |
-| `POST` | `/api/v1/templates` | Create a template |
+| `POST` | `/api/v1/templates` | Create a template: `201`, `409` if the name is taken |
 | `GET` | `/api/v1/templates`, `/api/v1/templates/{id}` | List and read templates |
+| `PUT` | `/api/v1/templates/{id}` | Replace a template's body |
+| `GET` | `/api/v1/stats?window=5m` | Human-readable delivery snapshot (§9) |
 | `GET` | `/api/v1/ws?notificationId=` or `?batchId=` | WebSocket stream of status changes |
 | `GET` | `/metrics` | Prometheus metrics |
 | `GET` | `/healthz`, `/readyz` | Liveness; readiness checks PostgreSQL and Redis |
@@ -513,8 +515,22 @@ and the result is stored as `content`. This has three effects:
 - The worker does not need to know about templates.
 - Editing a template later does not change notifications that are already queued.
 
-A missing variable or a template for a different channel is a `400`. The renderer only substitutes
-`{{name}}` placeholders, with no logic or code execution, so template authors cannot inject behaviour.
+A missing variable, a template for a different channel, sending both `content` and `templateId`, or
+a text that is too long once rendered is a `400`. A body with a malformed placeholder (`{{name` or
+`{{ 1x }}`) is rejected when the template is created, not when it is used.
+
+The renderer only substitutes `{{name}}` placeholders. There is no logic and no code execution, so a
+template author cannot make the service do anything else. Values are inserted as plain text and never
+expanded again, so a value of `{{order}}` stays literally `{{order}}`.
+
+**Idempotency with templates.** For a template request, the request hash covers what the client
+sent, `templateId` and `variables`, not the rendered text. Suppose a template is edited between a
+request and its retry. If the hash covered the rendered text, the identical retry would look like
+"same key, different content" and get a `422`. Hashing the request instead returns the original
+notification with `200`. `TestNotificationFromTemplate` checks this case and also checks that the
+existing notification keeps its original text after the edit.
+
+Within a batch, each template is read once, however many items use it.
 
 ### 10.2 WebSocket status updates
 

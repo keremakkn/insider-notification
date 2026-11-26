@@ -46,19 +46,29 @@ type StatsSource interface {
 
 // Options are the router's dependencies. Only Service and Log are required.
 type Options struct {
-	Service  Service
-	Log      *slog.Logger
-	Metrics  *metrics.API        // records request latency and creations
-	Gatherer prometheus.Gatherer // served at /metrics
-	Ready    []health.Check      // checked by /readyz
-	Stats    StatsSource         // served at /api/v1/stats
+	Service   Service
+	Log       *slog.Logger
+	Metrics   *metrics.API        // records request latency and creations
+	Gatherer  prometheus.Gatherer // served at /metrics
+	Ready     []health.Check      // checked by /readyz
+	Stats     StatsSource         // served at /api/v1/stats
+	Templates TemplateService     // served at /api/v1/templates
+}
+
+// TemplateService manages message templates.
+type TemplateService interface {
+	Create(ctx context.Context, name, channel, body string) (domain.Template, error)
+	Get(ctx context.Context, id uuid.UUID) (domain.Template, error)
+	List(ctx context.Context) ([]domain.Template, error)
+	Update(ctx context.Context, id uuid.UUID, body string) (domain.Template, error)
 }
 
 type handlers struct {
-	svc     Service
-	log     *slog.Logger
-	metrics *metrics.API
-	stats   StatsSource
+	svc       Service
+	log       *slog.Logger
+	metrics   *metrics.API
+	stats     StatsSource
+	templates TemplateService
 }
 
 // NewRouter wires routes and middleware.
@@ -66,7 +76,7 @@ func NewRouter(o Options) http.Handler {
 	if o.Metrics == nil {
 		o.Metrics = metrics.NewAPI(prometheus.NewRegistry())
 	}
-	h := &handlers{svc: o.Service, log: o.Log, metrics: o.Metrics, stats: o.Stats}
+	h := &handlers{svc: o.Service, log: o.Log, metrics: o.Metrics, stats: o.Stats, templates: o.Templates}
 	r := chi.NewRouter()
 	r.Use(correlationID, requestLogger(o.Log), observe(o.Metrics), recoverer(o.Log))
 
@@ -87,6 +97,14 @@ func NewRouter(o Options) http.Handler {
 		r.Post("/{id}/cancel", h.cancel)
 	})
 	r.Get("/api/v1/batches/{id}", h.getBatch)
+	if o.Templates != nil {
+		r.Route("/api/v1/templates", func(r chi.Router) {
+			r.Post("/", h.createTemplate)
+			r.Get("/", h.listTemplates)
+			r.Get("/{id}", h.getTemplate)
+			r.Put("/{id}", h.updateTemplate)
+		})
+	}
 	return r
 }
 
@@ -96,14 +114,7 @@ func (h *handlers) create(w http.ResponseWriter, r *http.Request) {
 	if !h.decode(w, r, &body, maxBodyBytes) {
 		return
 	}
-	n, created, err := h.svc.Create(r.Context(), domain.CreateRequest{
-		Recipient:      body.Recipient,
-		Channel:        body.Channel,
-		Content:        body.Content,
-		Priority:       body.Priority,
-		ScheduledAt:    body.ScheduledAt,
-		IdempotencyKey: r.Header.Get(IdempotencyHeader),
-	}, CorrelationIDFrom(r.Context()))
+	n, created, err := h.svc.Create(r.Context(), body.toDomain(r.Header.Get(IdempotencyHeader)), CorrelationIDFrom(r.Context()))
 	if err != nil {
 		h.writeError(w, r, err, nil)
 		return
@@ -214,10 +225,7 @@ func (h *handlers) createBatch(w http.ResponseWriter, r *http.Request) {
 	}
 	reqs := make([]domain.CreateRequest, len(body.Items))
 	for i, it := range body.Items {
-		reqs[i] = domain.CreateRequest{
-			Recipient: it.Recipient, Channel: it.Channel, Content: it.Content,
-			Priority: it.Priority, ScheduledAt: it.ScheduledAt, IdempotencyKey: it.IdempotencyKey,
-		}
+		reqs[i] = it.toDomain(it.IdempotencyKey)
 	}
 	res, err := h.svc.CreateBatch(r.Context(), reqs, CorrelationIDFrom(r.Context()))
 	if err != nil {
@@ -330,6 +338,10 @@ func (h *handlers) writeError(w http.ResponseWriter, r *http.Request, err error,
 			body.Error.Current = &c
 		}
 		writeJSON(w, http.StatusConflict, body)
+	case errors.Is(err, domain.ErrTemplateNotFound):
+		writeJSON(w, http.StatusNotFound, errorBody("not_found", "template not found", nil))
+	case errors.Is(err, domain.ErrTemplateNameTaken):
+		writeJSON(w, http.StatusConflict, errorBody("name_taken", err.Error(), nil))
 	case errors.Is(err, domain.ErrIdempotencyMismatch):
 		writeJSON(w, http.StatusUnprocessableEntity, errorBody("idempotency_key_reused", err.Error(), nil))
 	default:

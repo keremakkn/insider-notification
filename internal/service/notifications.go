@@ -3,6 +3,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -28,20 +29,74 @@ const (
 	MaxPageSize     = 200
 )
 
+// TemplateGetter loads the template a request names.
+type TemplateGetter interface {
+	Get(ctx context.Context, id uuid.UUID) (domain.Template, error)
+}
+
 type Notifications struct {
 	repo        Repository
+	templates   TemplateGetter
 	maxAttempts int
 	now         func() time.Time
 }
 
-func NewNotifications(repo Repository, maxAttempts int) *Notifications {
-	return &Notifications{repo: repo, maxAttempts: maxAttempts, now: time.Now}
+func NewNotifications(repo Repository, templates TemplateGetter, maxAttempts int) *Notifications {
+	return &Notifications{repo: repo, templates: templates, maxAttempts: maxAttempts, now: time.Now}
+}
+
+// render turns a template request into content, in place. Rendering happens
+// here, when the notification is created, so that the content rules (such
+// as the SMS length) run on the final text and a too-long message is a 400
+// now rather than a failure later, and so that editing the template does not
+// change notifications that already exist. cache avoids reading the same
+// template once per item of a batch.
+func (s *Notifications) render(ctx context.Context, req *domain.CreateRequest, cache map[uuid.UUID]domain.Template) error {
+	var v domain.ValidationError
+	if req.TemplateID == nil {
+		if len(req.Variables) > 0 {
+			v.Add("variables", "are only used with templateId")
+			return &v
+		}
+		return nil
+	}
+	if req.Content != "" {
+		v.Add("content", "send either content or templateId, not both")
+		return &v
+	}
+	t, ok := cache[*req.TemplateID]
+	if !ok {
+		var err error
+		t, err = s.templates.Get(ctx, *req.TemplateID)
+		if errors.Is(err, domain.ErrTemplateNotFound) {
+			v.Add("templateId", "no template with this id")
+			return &v
+		}
+		if err != nil {
+			return err
+		}
+		cache[t.ID] = t
+	}
+	if req.Channel != "" && string(t.Channel) != req.Channel {
+		v.Add("templateId", fmt.Sprintf("is a %s template, but the notification channel is %s", t.Channel, req.Channel))
+		return &v
+	}
+	content, err := t.Render(req.Variables)
+	if err != nil {
+		v.Add("variables", err.Error())
+		return &v
+	}
+	req.Content = content
+	return nil
 }
 
 // Create validates and stores a notification. created is false when the
 // idempotency key was seen before with the same request; the original is
 // returned. The same key with a different request is ErrIdempotencyMismatch.
 func (s *Notifications) Create(ctx context.Context, req domain.CreateRequest, correlationID string) (n domain.Notification, created bool, err error) {
+	if err := s.render(ctx, &req, map[uuid.UUID]domain.Template{}); err != nil {
+		return domain.Notification{}, false, err
+	}
 	n, err = domain.NewNotification(req, s.maxAttempts, s.now())
 	if err != nil {
 		return domain.Notification{}, false, err
@@ -124,8 +179,17 @@ func (s *Notifications) CreateBatch(ctx context.Context, reqs []domain.CreateReq
 		valid   []domain.Notification
 		indexes []int // position in reqs of each valid notification
 	)
+	cache := map[uuid.UUID]domain.Template{}
 	for i, req := range reqs {
 		result.Items[i].Index = i
+		if err := s.render(ctx, &req, cache); err != nil {
+			var v *domain.ValidationError
+			if !errors.As(err, &v) {
+				return BatchResult{}, err // the database failed, not the item
+			}
+			result.Items[i].Err = err
+			continue
+		}
 		n, err := domain.NewNotification(req, s.maxAttempts, now)
 		if err != nil {
 			result.Items[i].Err = err

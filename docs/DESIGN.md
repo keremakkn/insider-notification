@@ -20,7 +20,7 @@ The resulting guarantees:
 |---|---|
 | An accepted notification is never lost | PostgreSQL is the source of truth; a dispatcher re-queues anything that is pending but not in the queue (§5) |
 | One request creates at most one notification | `Idempotency-Key` + unique index + request hash (§4.2) |
-| Delivery is **at-least-once** | A crash after the provider accepted but before the DB update causes one resend; the provider receives `X-Idempotency-Key` so it can drop the duplicate (§6.5) |
+| Delivery is **at-least-once** | A crash after the provider accepted but before the DB update causes one resend; the provider receives `X-Idempotency-Key` so it can drop the duplicate (§6.6) |
 | At most 100 messages/s per channel | Token bucket per channel in each worker process (§6.2) |
 | High priority goes first, low priority is never starved | Weighted dequeue 6/3/1 (§6.3) and dispatcher fill order (§5.3) |
 
@@ -233,7 +233,7 @@ The visibility timeout picks them up again later, so this case needs no special 
 
 `FOR UPDATE SKIP LOCKED` lets several dispatchers run at once without selecting the same rows.
 
-**Enqueuing the same ID twice is harmless.** The claim (§6.4) only succeeds for a `pending` row,
+**Enqueuing the same ID twice is harmless.** The claim (§6.5) only succeeds for a `pending` row,
 so the second worker affects 0 rows and skips it. `enqueued_at` is an optimisation; correctness does not depend on it.
 
 ### 5.3 Backpressure: keep Redis short, let the backlog wait in PostgreSQL
@@ -268,7 +268,7 @@ WHERE status = 'processing' AND lease_expires_at < now();
 ```
 
 A worker that died mid-delivery leaves its row in `processing`. After the lease expires, the row
-goes back to `pending` and is delivered again (this is where at-least-once comes from, §6.5).
+goes back to `pending` and is delivered again (this is where at-least-once comes from, §6.6).
 `LEASE_DURATION` (default 30 s) must be longer than the provider HTTP timeout (default 5 s).
 
 ## 6. Worker
@@ -297,10 +297,10 @@ sequenceDiagram
         D->>Q: RPUSH ids
     end
 
-    W->>W: wait for rate-limit token
     W->>Q: weighted LPOP (high/normal/low)
-    W->>DB: UPDATE … SET processing, lease WHERE status='pending'
-    alt 0 rows (cancelled or taken by another worker)
+    W->>W: wait for rate-limit token
+    W->>DB: UPDATE … SET processing, attempts+1, lease WHERE status='pending' AND next_attempt_at <= now()
+    alt 0 rows (cancelled, taken by another worker, or not due)
         W->>W: skip
     else claimed
         W->>P: POST {to, channel, content} + X-Idempotency-Key
@@ -314,13 +314,24 @@ sequenceDiagram
     end
 ```
 
-### 6.2 Order: token, then dequeue, then claim
+### 6.2 Order: dequeue, then token, then claim
 
-If a worker claimed first and then waited for a rate-limit token, the lease could expire while it
-waits under load, and another worker would deliver the same message. Taking the token first means
-a claimed message is sent immediately. If the queue turns out to be empty, one token is wasted, which does not matter.
+Two constraints decide where the rate-limit token is taken:
 
-The limiter is `golang.org/x/time/rate`, one token bucket per channel (100/s, small burst), shared by
+- **Not after the claim.** A claimed message waiting for a token under load could outlive its lease,
+  and another worker would deliver it too.
+- **Not before the dequeue.** This was the first design, and a test proved it wrong. Idle workers
+  each take a token and then block on an empty queue for up to a second. When a burst arrives,
+  those saved tokens are spent at once on top of the bucket's normal rate. With a limit of 50/s the
+  provider saw 70 requests in one second (`TestRateLimitHoldsAfterIdle`).
+
+So a worker pops an ID, then waits for a token, then claims. The token is spent right before the
+provider call, so no one-second window exceeds the limit (the test measures 51 with a burst of 1).
+An unclaimed message has no lease to lose, and the wait is bounded by
+`workers / rate = 20 / 100 = 0.2 s`, far below the visibility timeout. If the claim then fails
+(cancelled, or taken by another worker), a token is wasted: the service under-sends, never over-sends.
+
+The limiter is `golang.org/x/time/rate`, one token bucket per channel (100/s, burst 1), shared by
 all workers of that channel in the process. It is in memory, so two worker processes would allow
 200/s in total. Scaling out would need a Redis-based limiter. This is documented as a known limitation.
 
@@ -335,7 +346,29 @@ priority order. If all are empty, they block on `BLPOP` across the three queues 
 Each channel has its own pool, so a slow email provider cannot block SMS. Pool size comes from
 Little's law: `workers = rate × latency = 100/s × ~0.2 s ≈ 20`. The default is 20 per channel, configurable.
 
-### 6.5 Delivery guarantee: at-least-once
+### 6.5 Claim conditions and fencing
+
+The claim is one `UPDATE … WHERE id = $1 AND status = 'pending' AND next_attempt_at <= now()`.
+It increments `attempts` and sets the lease. Each condition closes one race:
+
+- `status = 'pending'`: a cancelled notification, or one another worker already claimed, is skipped.
+- `next_attempt_at <= now()`: the visibility timeout can leave a second copy of an ID in Redis. If
+  the first copy failed and was rescheduled for a later retry, the stale copy must not send it early.
+
+Counting the attempt at claim time means a worker that crashes still uses up an attempt. When the
+dispatcher recovers an expired lease with no attempts left, the notification fails instead of
+crashing workers forever.
+
+The `attempts` value returned by the claim also works as a **fencing token**. Worker A's lease can
+expire while the provider is slow, and worker B can claim the notification again (`attempts` becomes 2).
+When A's answer finally arrives, A writes its result with `WHERE attempts = 1`, matches nothing, and
+backs off (`ErrLeaseLost`). A late worker can never overwrite the current owner's result. Both
+provider calls are still recorded in `delivery_attempts`.
+
+On shutdown a worker stops taking new messages but finishes a delivery already in flight.
+Abandoning it halfway would only cause a resend once the lease expires.
+
+### 6.6 Delivery guarantee: at-least-once
 
 If the provider accepts a message and the worker dies before writing `sent`, the lease expires and
 the message is sent again. This cannot be fully prevented: the provider call and the database update
@@ -345,7 +378,7 @@ and at-most-once. We choose **at-least-once**, because a lost notification is in
 To help, every provider request carries `X-Idempotency-Key: <notification id>`. A provider that
 supports it drops the duplicate. The request body stays `{to, channel, content}` as required.
 
-### 6.6 Cancellation
+### 6.7 Cancellation
 
 ```sql
 UPDATE notifications SET status = 'cancelled' WHERE id = $1 AND status = 'pending';
@@ -534,7 +567,7 @@ Dependencies point inward. Interfaces are declared where they are used, so each 
 
 ## 14. Known limitations
 
-- At-least-once delivery: a crash at the wrong moment sends a notification twice (§6.5).
+- At-least-once delivery: a crash at the wrong moment sends a notification twice (§6.6).
 - The rate limiter is per process; multiple worker processes need a shared (Redis) limiter.
 - SMS is limited to a single segment; multi-part SMS (153/67 characters per part) is not supported.
 - No delivery receipts: `sent` means accepted by the provider.

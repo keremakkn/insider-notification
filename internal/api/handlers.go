@@ -80,6 +80,16 @@ type handlers struct {
 
 // NewRouter wires routes and middleware.
 func NewRouter(o Options) http.Handler {
+	// The server span wraps everything, so the correlation middleware can
+	// reuse its trace ID. Probes and scrapes would only add noise. An
+	// incoming traceparent (from a caller that traces) makes this request
+	// part of the caller's trace.
+	return otelhttp.NewHandler(routes(o), "http",
+		otelhttp.WithPropagators(propagation.TraceContext{}),
+		otelhttp.WithFilter(func(r *http.Request) bool { return !quiet[r.URL.Path] }))
+}
+
+func routes(o Options) chi.Router {
 	if o.Metrics == nil {
 		o.Metrics = metrics.NewAPI(prometheus.NewRegistry())
 	}
@@ -90,7 +100,7 @@ func NewRouter(o Options) http.Handler {
 	r.Get("/healthz", health.Live)
 	r.Get("/readyz", health.Ready(o.Ready...))
 	if o.Gatherer != nil {
-		r.Handle("/metrics", promhttp.HandlerFor(o.Gatherer, promhttp.HandlerOpts{}))
+		r.Method(http.MethodGet, "/metrics", promhttp.HandlerFor(o.Gatherer, promhttp.HandlerOpts{}))
 	}
 	if o.Stats != nil {
 		r.Get("/api/v1/stats", h.getStats)
@@ -115,13 +125,9 @@ func NewRouter(o Options) http.Handler {
 			r.Put("/{id}", h.updateTemplate)
 		})
 	}
-	// The server span wraps everything, so the correlation middleware can
-	// reuse its trace ID. Probes and scrapes would only add noise.
-	// An incoming traceparent (from a caller that traces) makes this request
-	// part of the caller's trace.
-	return otelhttp.NewHandler(r, "http",
-		otelhttp.WithPropagators(propagation.TraceContext{}),
-		otelhttp.WithFilter(func(r *http.Request) bool { return !quiet[r.URL.Path] }))
+	r.Get("/openapi.yaml", serveSpec)
+	r.Get("/docs", serveDocs)
+	return r
 }
 
 // create answers 202 for a new notification and 200 for an idempotent replay.

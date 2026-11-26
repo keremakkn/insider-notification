@@ -59,7 +59,7 @@ func run() error {
 	}
 	defer db.Close()
 
-	rdb, err := queue.Connect(ctx, cfg.RedisAddr)
+	rdb, err := queue.Connect(ctx, cfg.RedisAddr, 0)
 	if err != nil {
 		return err
 	}

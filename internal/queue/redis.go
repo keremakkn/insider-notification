@@ -16,8 +16,15 @@ import (
 )
 
 // Connect opens a Redis client and checks that the server answers.
-func Connect(ctx context.Context, addr string) (*redis.Client, error) {
-	rdb := redis.NewClient(&redis.Options{Addr: addr})
+//
+// poolSize must cover every worker that may block in BLPOP at once: each
+// blocked call holds a connection for up to a second. go-redis defaults to
+// 10 per CPU, so on a 2-CPU machine 20 connections were all taken by idle
+// workers of empty channels while the busy channel waited for one, and
+// throughput fell to a few messages per second. 0 keeps the default, which
+// is fine for processes that do not block (the api).
+func Connect(ctx context.Context, addr string, poolSize int) (*redis.Client, error) {
+	rdb := redis.NewClient(&redis.Options{Addr: addr, PoolSize: poolSize})
 	if err := rdb.Ping(ctx).Err(); err != nil {
 		_ = rdb.Close()
 		return nil, fmt.Errorf("ping redis: %w", err)

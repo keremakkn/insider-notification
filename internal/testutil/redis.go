@@ -27,6 +27,9 @@ func StartRedis(ctx context.Context) (*goredis.Client, func(), error) {
 		stop()
 		return nil, nil, err
 	}
+	// Sized for the worker tests: 3 channels × 20 workers blocking in BLPOP.
+	// The default (10 per CPU) starves them on small CI machines.
+	opts.PoolSize = 100
 	rdb := goredis.NewClient(opts)
 	return rdb, func() { _ = rdb.Close(); stop() }, nil
 }

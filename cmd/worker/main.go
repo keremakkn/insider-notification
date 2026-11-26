@@ -65,7 +65,9 @@ func run() error {
 		return err
 	}
 	defer db.Close()
-	rdb, err := queue.Connect(ctx, cfg.RedisAddr)
+	// One connection per worker that can block in BLPOP, plus room for the
+	// dispatcher, metrics and status events.
+	rdb, err := queue.Connect(ctx, cfg.RedisAddr, len(domain.Channels)*cfg.WorkersPerChannel+10)
 	if err != nil {
 		return err
 	}

@@ -34,8 +34,14 @@ type TemplateGetter interface {
 	Get(ctx context.Context, id uuid.UUID) (domain.Template, error)
 }
 
+// Publisher announces status changes made here (cancellation).
+type Publisher interface {
+	Publish(ctx context.Context, c domain.StatusChange)
+}
+
 type Notifications struct {
 	repo        Repository
+	events      Publisher
 	templates   TemplateGetter
 	maxAttempts int
 	now         func() time.Time
@@ -43,6 +49,12 @@ type Notifications struct {
 
 func NewNotifications(repo Repository, templates TemplateGetter, maxAttempts int) *Notifications {
 	return &Notifications{repo: repo, templates: templates, maxAttempts: maxAttempts, now: time.Now}
+}
+
+// PublishTo makes the service announce the status changes it makes.
+func (s *Notifications) PublishTo(p Publisher) *Notifications {
+	s.events = p
+	return s
 }
 
 // render turns a template request into content, in place. Rendering happens
@@ -120,7 +132,11 @@ func (s *Notifications) Get(ctx context.Context, id uuid.UUID) (domain.Notificat
 // Cancel cancels a pending notification. On ErrNotCancellable the current
 // notification is returned too, so the caller can show its status.
 func (s *Notifications) Cancel(ctx context.Context, id uuid.UUID) (domain.Notification, error) {
-	return s.repo.Cancel(ctx, id)
+	n, err := s.repo.Cancel(ctx, id)
+	if err == nil && s.events != nil {
+		s.events.Publish(ctx, domain.ChangeOf(n, s.now()))
+	}
+	return n, err
 }
 
 func (s *Notifications) List(ctx context.Context, f domain.ListFilter) ([]domain.Notification, *domain.Cursor, error) {

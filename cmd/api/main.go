@@ -16,9 +16,11 @@ import (
 
 	"github.com/keremakkn/insider-notification/internal/api"
 	"github.com/keremakkn/insider-notification/internal/config"
+	"github.com/keremakkn/insider-notification/internal/events"
 	"github.com/keremakkn/insider-notification/internal/health"
 	"github.com/keremakkn/insider-notification/internal/metrics"
 	"github.com/keremakkn/insider-notification/internal/queue"
+	"github.com/keremakkn/insider-notification/internal/realtime"
 	"github.com/keremakkn/insider-notification/internal/repository"
 	"github.com/keremakkn/insider-notification/internal/service"
 )
@@ -59,8 +61,21 @@ func run() error {
 	metrics.RegisterQueueDepth(reg, q)
 
 	templates := repository.NewTemplates(db)
+	ev := events.NewRedis(rdb, log)
+	hub := realtime.NewHub()
+	go func() {
+		// Feed this process's WebSocket clients from every process's changes.
+		for ctx.Err() == nil {
+			if err := ev.Subscribe(ctx, hub.Deliver); err != nil {
+				log.Error("status change subscription", "error", err)
+				time.Sleep(time.Second)
+			}
+		}
+	}()
 	router := api.NewRouter(api.Options{
-		Service:   service.NewNotifications(repo, templates, cfg.MaxAttempts),
+		Service:   service.NewNotifications(repo, templates, cfg.MaxAttempts).PublishTo(ev),
+		Hub:       hub,
+		WSOrigins: cfg.WSOrigins,
 		Templates: service.NewTemplates(templates),
 		Log:       log,
 		Metrics:   metrics.NewAPI(reg),

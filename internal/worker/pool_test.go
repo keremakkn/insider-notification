@@ -87,6 +87,30 @@ func (f *fakeProvider) count() int {
 	return len(f.requests)
 }
 
+// recordingEvents keeps every published status change.
+type recordingEvents struct {
+	mu      sync.Mutex
+	changes []domain.StatusChange
+}
+
+func (r *recordingEvents) Publish(_ context.Context, c domain.StatusChange) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.changes = append(r.changes, c)
+}
+
+func (r *recordingEvents) statuses(id uuid.UUID) []domain.Status {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []domain.Status
+	for _, c := range r.changes {
+		if c.ID == id {
+			out = append(out, c.Status)
+		}
+	}
+	return out
+}
+
 // recordingSender notes when the worker hands a message to the provider,
 // which is the moment the rate limiter controls. Times taken where the
 // request arrives at the fake server also include network and scheduler
@@ -114,6 +138,7 @@ type system struct {
 	done     chan struct{}
 	attempts int // max attempts for notifications this test creates
 	metrics  *metrics.Delivery
+	events   *recordingEvents
 }
 
 // slowClaims makes every claim take a random 0–200 ms, as on a busy
@@ -164,6 +189,7 @@ func start(t *testing.T, o options) *system {
 
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	m := metrics.NewDelivery(prometheus.NewRegistry())
+	ev := &recordingEvents{}
 	repo := repository.NewNotifications(pool)
 	q := queue.New(rdb, [3]int{6, 3, 1}, time.Second)
 	sender := &recordingSender{inner: provider.NewHTTP(srv.URL, 2*time.Second)}
@@ -179,11 +205,11 @@ func start(t *testing.T, o options) *system {
 	workers := NewPool(store, q, senders, Config{
 		WorkersPerChannel: o.workers, RatePerSecond: o.rate, Lease: 10 * time.Second,
 		Backoff:          NewBackoff(25*time.Millisecond, 100*time.Millisecond),
-		BreakerThreshold: o.breaker, BreakerCooldown: 300 * time.Millisecond, Metrics: m,
+		BreakerThreshold: o.breaker, BreakerCooldown: 300 * time.Millisecond, Metrics: m, Events: ev,
 	}, log)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	s := &system{sent: sender, t: t, repo: repo, provider: fp, cancel: cancel, done: make(chan struct{}), attempts: o.maxAttempt, metrics: m}
+	s := &system{sent: sender, t: t, repo: repo, provider: fp, cancel: cancel, done: make(chan struct{}), attempts: o.maxAttempt, metrics: m, events: ev}
 	go disp.Run(ctx)
 	go func() { workers.Run(ctx); close(s.done) }()
 	t.Cleanup(s.stop)
@@ -256,6 +282,25 @@ func TestDeliversEndToEnd(t *testing.T) {
 		if !keys[id.String()] {
 			t.Fatalf("provider never saw X-Idempotency-Key %s", id)
 		}
+	}
+}
+
+// Every transition is announced, in order, so a WebSocket client can follow it.
+func TestStatusChangesArePublished(t *testing.T) {
+	var calls atomic.Int32
+	s := start(t, options{handler: func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}})
+	ids := s.create(domain.ChannelSMS, 1)
+	s.waitFor(ids, 5*time.Second)
+
+	got := fmt.Sprint(s.events.statuses(ids[0]))
+	if got != "[processing pending processing sent]" {
+		t.Fatalf("want claim, retry, claim, sent; got %s", got)
 	}
 }
 

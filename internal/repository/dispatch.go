@@ -64,11 +64,12 @@ func (r *Notifications) TakeDue(ctx context.Context, c domain.Channel, p domain.
 }
 
 // RecoverExpiredLeases releases notifications whose worker stopped
-// renewing them (it crashed or hung). Attempts are counted when a worker
+// renewing them (it crashed or hung) and returns what changed, so the
+// caller can count and announce it. Attempts are counted when a worker
 // claims a notification, so a recovered row has already used its attempt:
 // if none are left it fails instead of looping forever on a message that
 // keeps crashing workers.
-func (r *Notifications) RecoverExpiredLeases(ctx context.Context) (requeued, failed int, err error) {
+func (r *Notifications) RecoverExpiredLeases(ctx context.Context) ([]domain.StatusChange, error) {
 	rows, err := r.db.Query(ctx, `
 		UPDATE notifications SET
 			status           = CASE WHEN attempts >= max_attempts THEN 'failed' ELSE 'pending' END,
@@ -76,20 +77,21 @@ func (r *Notifications) RecoverExpiredLeases(ctx context.Context) (requeued, fai
 			enqueued_at      = NULL,
 			lease_expires_at = NULL
 		WHERE status = 'processing' AND lease_expires_at < now()
-		RETURNING status`)
+		RETURNING id, batch_id, channel, status, attempts, coalesce(last_error, ''), updated_at`)
 	if err != nil {
-		return 0, 0, fmt.Errorf("recover leases: %w", err)
+		return nil, fmt.Errorf("recover leases: %w", err)
 	}
-	statuses, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	changes, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (domain.StatusChange, error) {
+		var (
+			c               domain.StatusChange
+			channel, status string
+		)
+		err := row.Scan(&c.ID, &c.BatchID, &channel, &status, &c.Attempts, &c.Error, &c.At)
+		c.Channel, c.Status = domain.Channel(channel), domain.Status(status)
+		return c, err
+	})
 	if err != nil {
-		return 0, 0, fmt.Errorf("recover leases: %w", err)
+		return nil, fmt.Errorf("recover leases: %w", err)
 	}
-	for _, s := range statuses {
-		if s == string(domain.StatusFailed) {
-			failed++
-		} else {
-			requeued++
-		}
-	}
-	return requeued, failed, nil
+	return changes, nil
 }

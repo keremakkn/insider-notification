@@ -20,6 +20,7 @@ import (
 	"github.com/keremakkn/insider-notification/internal/config"
 	"github.com/keremakkn/insider-notification/internal/dispatcher"
 	"github.com/keremakkn/insider-notification/internal/domain"
+	"github.com/keremakkn/insider-notification/internal/events"
 	"github.com/keremakkn/insider-notification/internal/health"
 	"github.com/keremakkn/insider-notification/internal/metrics"
 	"github.com/keremakkn/insider-notification/internal/provider"
@@ -64,12 +65,14 @@ func run() error {
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	m := metrics.NewDelivery(reg)
+	ev := events.NewRedis(rdb, log)
 	metrics.RegisterQueueDepth(reg, q)
 	disp := dispatcher.New(repo, q, dispatcher.Config{
 		Interval:          cfg.DispatchInterval,
 		Thresholds:        cfg.QueueThresholds,
 		VisibilityTimeout: cfg.VisibilityTimeout,
 		Metrics:           m,
+		Events:            ev,
 	}, log)
 
 	// Every channel uses the same provider here; each could get its own.
@@ -85,6 +88,7 @@ func run() error {
 		BreakerThreshold:  cfg.BreakerThreshold,
 		BreakerCooldown:   cfg.BreakerCooldown,
 		Metrics:           m,
+		Events:            ev,
 	}, log)
 
 	// The worker serves no API, only probes and metrics for operators.

@@ -16,7 +16,8 @@ const NumPriorities = 3
 
 type Config struct {
 	HTTPAddr    string
-	MetricsAddr string // worker: /metrics and health probes
+	MetricsAddr string   // worker: /metrics and health probes
+	WSOrigins   []string // browser origins allowed to open WebSockets
 	DatabaseURL string
 	RedisAddr   string
 	LogLevel    string
@@ -51,6 +52,7 @@ func load(getenv func(string) string) (Config, error) {
 	c := Config{
 		HTTPAddr:    p.str("HTTP_ADDR", ":8080"),
 		MetricsAddr: p.str("METRICS_ADDR", ":9091"),
+		WSOrigins:   splitList(p.str("WS_ALLOWED_ORIGINS", "localhost:*")),
 		DatabaseURL: p.str("DATABASE_URL", "postgres://notifier:notifier@localhost:5432/notifier?sslmode=disable"),
 		RedisAddr:   p.str("REDIS_ADDR", "localhost:6379"),
 		LogLevel:    p.str("LOG_LEVEL", "info"),
@@ -199,6 +201,16 @@ func (p *parser) triple(key string, def [NumPriorities]int) [NumPriorities]int {
 			return def
 		}
 		out[i] = n
+	}
+	return out
+}
+
+func splitList(s string) []string {
+	var out []string
+	for _, part := range strings.Split(s, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
 	}
 	return out
 }

@@ -74,7 +74,7 @@ func TestFinishWithAStaleClaimIsFenced(t *testing.T) {
 	if _, err := pool.Exec(ctx, `UPDATE notifications SET lease_expires_at = now() - interval '1 second' WHERE id = $1`, n.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := repo.RecoverExpiredLeases(ctx); err != nil {
+	if _, err := repo.RecoverExpiredLeases(ctx); err != nil {
 		t.Fatal(err)
 	}
 	b, ok, _ := repo.Claim(ctx, n.ID, 30*time.Second)

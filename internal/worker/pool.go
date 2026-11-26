@@ -15,6 +15,7 @@ import (
 	"golang.org/x/time/rate"
 
 	"github.com/keremakkn/insider-notification/internal/domain"
+	"github.com/keremakkn/insider-notification/internal/events"
 	"github.com/keremakkn/insider-notification/internal/metrics"
 	"github.com/keremakkn/insider-notification/internal/provider"
 )
@@ -36,6 +37,7 @@ type Config struct {
 	BreakerThreshold  int           // consecutive provider failures that open a channel's breaker
 	BreakerCooldown   time.Duration // how long it stays open before one probe
 	Metrics           *metrics.Delivery
+	Events            events.Publisher // announces every status change
 }
 
 type Pool struct {
@@ -50,6 +52,9 @@ type Pool struct {
 func NewPool(store Store, queue Queue, senders map[domain.Channel]provider.Sender, cfg Config, log *slog.Logger) *Pool {
 	if cfg.Metrics == nil {
 		cfg.Metrics = metrics.NewDelivery(prometheus.NewRegistry())
+	}
+	if cfg.Events == nil {
+		cfg.Events = events.Nop{}
 	}
 	p := &Pool{store: store, queue: queue, senders: senders, cfg: cfg, log: log.With("component", "worker"),
 		breakers: map[domain.Channel]*Breaker{}}
@@ -137,6 +142,7 @@ func (p *Pool) process(ctx context.Context, id uuid.UUID, limiter *rate.Limiter)
 	}
 	log := p.log.With("notification_id", n.ID, "correlation_id", n.CorrelationID,
 		"channel", n.Channel, "priority", n.Priority.String(), "attempt", n.Attempts)
+	p.cfg.Events.Publish(ctx, domain.ChangeOf(n, time.Now()))
 
 	// The token is taken here, after the claim and right before the provider
 	// call, so nothing with a variable duration sits between the limiter and
@@ -159,6 +165,9 @@ func (p *Pool) process(ctx context.Context, id uuid.UUID, limiter *rate.Limiter)
 		log.Error("save outcome", "error", err)
 		return result
 	}
+
+	n.Status, n.LastError = o.Status, o.Error
+	p.cfg.Events.Publish(ctx, domain.ChangeOf(n, time.Now()))
 
 	attrs := []any{"status", o.Status, "duration_ms", o.Duration.Milliseconds()}
 	if o.HTTPStatus != 0 {

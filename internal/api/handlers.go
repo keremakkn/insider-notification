@@ -20,6 +20,7 @@ import (
 	"github.com/keremakkn/insider-notification/internal/domain"
 	"github.com/keremakkn/insider-notification/internal/health"
 	"github.com/keremakkn/insider-notification/internal/metrics"
+	"github.com/keremakkn/insider-notification/internal/realtime"
 	"github.com/keremakkn/insider-notification/internal/service"
 )
 
@@ -53,6 +54,8 @@ type Options struct {
 	Ready     []health.Check      // checked by /readyz
 	Stats     StatsSource         // served at /api/v1/stats
 	Templates TemplateService     // served at /api/v1/templates
+	Hub       *realtime.Hub       // serves /api/v1/ws when set
+	WSOrigins []string            // browser origins allowed to open a WebSocket; non-browser clients send none
 }
 
 // TemplateService manages message templates.
@@ -69,6 +72,8 @@ type handlers struct {
 	metrics   *metrics.API
 	stats     StatsSource
 	templates TemplateService
+	hub       *realtime.Hub
+	wsOrigins []string
 }
 
 // NewRouter wires routes and middleware.
@@ -76,7 +81,7 @@ func NewRouter(o Options) http.Handler {
 	if o.Metrics == nil {
 		o.Metrics = metrics.NewAPI(prometheus.NewRegistry())
 	}
-	h := &handlers{svc: o.Service, log: o.Log, metrics: o.Metrics, stats: o.Stats, templates: o.Templates}
+	h := &handlers{svc: o.Service, log: o.Log, metrics: o.Metrics, stats: o.Stats, templates: o.Templates, hub: o.Hub, wsOrigins: o.WSOrigins}
 	r := chi.NewRouter()
 	r.Use(correlationID, requestLogger(o.Log), observe(o.Metrics), recoverer(o.Log))
 
@@ -97,6 +102,9 @@ func NewRouter(o Options) http.Handler {
 		r.Post("/{id}/cancel", h.cancel)
 	})
 	r.Get("/api/v1/batches/{id}", h.getBatch)
+	if o.Hub != nil {
+		r.Get("/api/v1/ws", h.websocket)
+	}
 	if o.Templates != nil {
 		r.Route("/api/v1/templates", func(r chi.Router) {
 			r.Post("/", h.createTemplate)

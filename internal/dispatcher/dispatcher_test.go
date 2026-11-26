@@ -51,11 +51,18 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
+type recordingEvents struct{ changes []domain.StatusChange }
+
+func (r *recordingEvents) Publish(_ context.Context, c domain.StatusChange) {
+	r.changes = append(r.changes, c)
+}
+
 type env struct {
-	t     *testing.T
-	repo  *repository.Notifications
-	queue *queue.Queue
-	disp  *Dispatcher
+	events *recordingEvents
+	t      *testing.T
+	repo   *repository.Notifications
+	queue  *queue.Queue
+	disp   *Dispatcher
 }
 
 // Small thresholds make backpressure visible with a handful of rows.
@@ -72,7 +79,10 @@ func setup(t *testing.T) *env {
 	}
 	repo := repository.NewNotifications(pool)
 	q := queue.New(rdb, [3]int{6, 3, 1}, time.Second)
-	return &env{t: t, repo: repo, queue: q, disp: New(repo, q, testConfig, slog.New(slog.NewTextHandler(io.Discard, nil)))}
+	ev := &recordingEvents{}
+	cfg := testConfig
+	cfg.Events = ev
+	return &env{events: ev, t: t, repo: repo, queue: q, disp: New(repo, q, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))}
 }
 
 // create stores n pending notifications and returns their IDs.
@@ -226,6 +236,13 @@ func TestExpiredLeaseIsRecoveredAndRequeuedInTheSameTick(t *testing.T) {
 	s := e.disp.Tick(context.Background())
 	if s.Recovered != 1 || s.Failed != 1 || s.Dispatched != 1 {
 		t.Fatalf("want 1 recovered and dispatched, 1 failed: %+v", s)
+	}
+	var announced []domain.Status
+	for _, c := range e.events.changes {
+		announced = append(announced, c.Status)
+	}
+	if fmt.Sprint(announced) != "[pending failed]" && fmt.Sprint(announced) != "[failed pending]" {
+		t.Fatalf("both recoveries must be announced, the failure above all: %v", announced)
 	}
 	retry, _ := e.repo.Get(context.Background(), ids[0])
 	final, _ := e.repo.Get(context.Background(), ids[1])

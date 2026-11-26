@@ -12,12 +12,13 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/keremakkn/insider-notification/internal/domain"
+	"github.com/keremakkn/insider-notification/internal/events"
 	"github.com/keremakkn/insider-notification/internal/metrics"
 )
 
 type Store interface {
 	TakeDue(ctx context.Context, c domain.Channel, p domain.Priority, limit int, visibilityTimeout time.Duration) ([]uuid.UUID, error)
-	RecoverExpiredLeases(ctx context.Context) (requeued, failed int, err error)
+	RecoverExpiredLeases(ctx context.Context) ([]domain.StatusChange, error)
 }
 
 type Queue interface {
@@ -30,6 +31,7 @@ type Config struct {
 	Thresholds        [3]int // per priority: high, normal, low
 	VisibilityTimeout time.Duration
 	Metrics           *metrics.Delivery
+	Events            events.Publisher // announces recovered and failed leases
 }
 
 type Dispatcher struct {
@@ -42,6 +44,9 @@ type Dispatcher struct {
 func New(store Store, queue Queue, cfg Config, log *slog.Logger) *Dispatcher {
 	if cfg.Metrics == nil {
 		cfg.Metrics = metrics.NewDelivery(prometheus.NewRegistry())
+	}
+	if cfg.Events == nil {
+		cfg.Events = events.Nop{}
 	}
 	return &Dispatcher{store: store, queue: queue, cfg: cfg, log: log.With("component", "dispatcher")}
 }
@@ -79,12 +84,21 @@ func (d *Dispatcher) Run(ctx context.Context) {
 // a failure on one is logged and does not stop the others.
 func (d *Dispatcher) Tick(ctx context.Context) Stats {
 	var s Stats
-	requeued, failed, err := d.store.RecoverExpiredLeases(ctx)
+	changes, err := d.store.RecoverExpiredLeases(ctx)
 	if err != nil {
 		d.log.Error("recover leases", "error", err)
 		s.Errors++
 	}
-	s.Recovered, s.Failed = requeued, failed
+	for _, c := range changes {
+		if c.Status == domain.StatusFailed {
+			s.Failed++
+		} else {
+			s.Recovered++
+		}
+		// A client waiting for this notification must hear that it failed,
+		// or it would wait forever.
+		d.cfg.Events.Publish(ctx, c)
+	}
 
 	for _, c := range domain.Channels {
 		// High first: when room is scarce, it goes to the most urgent work.

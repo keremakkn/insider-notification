@@ -147,7 +147,7 @@ stateDiagram-v2
 | `GET` | `/api/v1/templates`, `/api/v1/templates/{id}` | List and read templates |
 | `PUT` | `/api/v1/templates/{id}` | Replace a template's body |
 | `GET` | `/api/v1/stats?window=5m` | Human-readable delivery snapshot (§9) |
-| `GET` | `/api/v1/ws?notificationId=` or `?batchId=` | WebSocket stream of status changes |
+| `GET` | `/api/v1/ws?notificationId=…&batchId=…` | WebSocket: a snapshot, then every status change (§10.2) |
 | `GET` | `/metrics` | Prometheus metrics |
 | `GET` | `/healthz`, `/readyz` | Liveness; readiness checks PostgreSQL and Redis |
 
@@ -544,11 +544,44 @@ flowchart LR
     API -->|push to clients watching<br/>this notification or batch| WS([WebSocket clients])
 ```
 
-Every state transition (claim, sent, retry, failed, cancel) publishes
-`{id, batchId, status, attempts, at}`. The API keeps an in-memory map from notification and batch IDs
-to connected clients. Pub/Sub is fire-and-forget: a client that disconnects misses events. That is
-acceptable because PostgreSQL stays the source of truth: on reconnect, the client reads the current
-state with `GET` and then follows the stream.
+Every status change is published as `{id, batchId, channel, status, attempts, error, at}`, by
+whichever process makes it:
+
+- the worker publishes claim, sent, retry and failed;
+- the api publishes cancel;
+- the dispatcher publishes recovered leases. When a lease expires on the final attempt, the
+  notification fails there, and a client waiting for the result must hear that.
+
+The client connects to `GET /api/v1/ws?notificationId=…&batchId=…` (each repeatable, up to 50) and
+receives messages in this order:
+
+1. **A snapshot of the current state.** The current notification, or the batch with counts per
+   status. The subscription is registered **before** the snapshot is read. In the other order, a
+   change landing between the read and the subscription would be lost. Changes that arrive in
+   between wait in the buffer.
+2. **Every change after that**, as `{"type":"status","change":{…}}`.
+
+Bad or unknown IDs are answered with `400` or `404` before the upgrade, so no subscription is left behind.
+
+```mermaid
+flowchart LR
+    W[Worker] -->|claim, sent, retry, failed| PS[(Redis Pub/Sub<br/>notification-events)]
+    D[Dispatcher] -->|lease recovered / failed| PS
+    A1[API: cancel] --> PS
+    PS --> H[Hub in every API process]
+    H -->|snapshot, then changes| WS([WebSocket clients])
+```
+
+- **Slow clients.** Each subscription buffers 64 messages. A client that falls further behind is
+  disconnected (close code 1008) instead of blocking the hub or growing memory, and should reconnect
+  and read the current state.
+- **Lost events.** Pub/Sub is fire-and-forget: an event published while an API process is
+  reconnecting to Redis is not replayed. This is acceptable because PostgreSQL stays the source of
+  truth, and every connection starts with a snapshot.
+- **Origins.** Browsers send an `Origin` header. Only origins in `WS_ALLOWED_ORIGINS` (default
+  `localhost:*`) may connect, so a page on another site cannot open the stream with a visitor's
+  browser. Non-browser clients send no origin and are not affected.
+- The connection is pinged every 30 s, and the HTTP server's request timeouts are lifted for it.
 
 ### 10.3 Distributed tracing
 
@@ -586,6 +619,7 @@ GitHub Actions on every push and pull request:
 | `BREAKER_THRESHOLD`, `BREAKER_COOLDOWN` | 5, 30s |
 | `PROVIDER_URL` | webhook.site URL |
 | `METRICS_ADDR` | :9091 (worker) |
+| `WS_ALLOWED_ORIGINS` | localhost:* |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Jaeger collector |
 
 ## 12. Code layout

@@ -63,9 +63,12 @@ func (r *Notifications) TakeDue(ctx context.Context, c domain.Channel, p domain.
 	return ids, nil
 }
 
-// RecoverExpiredLeases releases notifications whose worker stopped
-// renewing them (it crashed or hung) and returns what changed, so the
-// caller can count and announce it. Attempts are counted when a worker
+// RecoverExpiredLeases releases notifications whose lease ran out before
+// their worker saved a result (it crashed or hung) and returns what
+// changed, so the caller can count and announce it. Leases are not
+// renewed: one attempt is a single provider call, and config requires
+// LEASE_DURATION to be longer than PROVIDER_TIMEOUT (30 s against 5 s by
+// default), which leaves a live worker ample margin. Attempts are counted when a worker
 // claims a notification, so a recovered row has already used its attempt:
 // if none are left it fails instead of looping forever on a message that
 // keeps crashing workers.

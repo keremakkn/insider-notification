@@ -30,7 +30,7 @@ func (f fakeStats) Stats(_ context.Context, w time.Duration) (domain.Stats, erro
 
 func observedServer(t *testing.T, ready ...health.Check) (http.Handler, *prometheus.Registry) {
 	reg := prometheus.NewRegistry()
-	sms := &domain.ChannelStats{QueueDepth: map[domain.Priority]int{domain.PriorityHigh: 12}, Pending: 40,
+	sms := &domain.ChannelStats{QueueDepth: map[domain.Priority]int{domain.PriorityHigh: 12}, Pending: 40, NotYetDue: 7,
 		AttemptsOK: 98, AttemptsFailed: 2, Sent: 95, ProviderP50: 80 * time.Millisecond, EndToEndP95: 1500 * time.Millisecond}
 	srv := NewRouter(Options{
 		Service:  service.NewNotifications(testutil.NewMemRepo(), testutil.NewMemTemplates(), 5),
@@ -87,7 +87,7 @@ func TestStatsEndpoint(t *testing.T) {
 	}
 	body := decode[statsResponse](t, rec)
 	sms := body.Channels["sms"]
-	if body.Window != "15m0s" || sms.QueueDepth["high"] != 12 || sms.Pending != 40 || sms.Attempts != 100 ||
+	if body.Window != "15m0s" || sms.QueueDepth["high"] != 12 || sms.Pending != 40 || sms.NotYetDue != 7 || sms.Attempts != 100 ||
 		sms.SuccessRate == nil || *sms.SuccessRate != 0.98 || sms.ProviderLatencyMs.P50 != 80 || sms.EndToEndMs.P95 != 1500 {
 		t.Fatalf("unexpected stats: %+v", sms)
 	}

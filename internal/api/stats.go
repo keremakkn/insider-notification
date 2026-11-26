@@ -20,6 +20,7 @@ type statsResponse struct {
 type channelStatsResponse struct {
 	QueueDepth map[string]int `json:"queueDepth"`
 	Pending    int            `json:"pending"`
+	NotYetDue  int            `json:"notYetDue"`
 	Processing int            `json:"processing"`
 
 	Sent        int      `json:"sent"`
@@ -65,7 +66,7 @@ func (h *handlers) getStats(w http.ResponseWriter, r *http.Request) {
 			depth[p.String()] = cs.QueueDepth[p]
 		}
 		resp.Channels[string(c)] = channelStatsResponse{
-			QueueDepth: depth, Pending: cs.Pending, Processing: cs.Processing,
+			QueueDepth: depth, Pending: cs.Pending, NotYetDue: cs.NotYetDue, Processing: cs.Processing,
 			Sent: cs.Sent, Failed: cs.Failed, Attempts: cs.AttemptsOK + cs.AttemptsFailed, SuccessRate: cs.SuccessRate(),
 			ProviderLatencyMs: latency{cs.ProviderP50.Milliseconds(), cs.ProviderP95.Milliseconds()},
 			EndToEndMs:        latency{cs.EndToEndP50.Milliseconds(), cs.EndToEndP95.Milliseconds()},

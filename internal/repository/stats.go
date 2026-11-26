@@ -19,23 +19,24 @@ func (r *Notifications) Stats(ctx context.Context, window time.Duration) (domain
 	secs := window.Seconds()
 
 	rows, err := r.db.Query(ctx, `
-		SELECT channel, status, count(*) FROM notifications
+		SELECT channel, status, count(*), count(*) FILTER (WHERE next_attempt_at > now())
+		FROM notifications
 		WHERE status IN ('pending', 'processing') GROUP BY channel, status`)
 	if err != nil {
 		return s, fmt.Errorf("stats: current: %w", err)
 	}
 	for rows.Next() {
 		var (
-			ch, st string
-			n      int
+			ch, st    string
+			n, notDue int
 		)
-		if err := rows.Scan(&ch, &st, &n); err != nil {
+		if err := rows.Scan(&ch, &st, &n, &notDue); err != nil {
 			rows.Close()
 			return s, err
 		}
 		if cs := s.Channels[domain.Channel(ch)]; cs != nil {
 			if st == string(domain.StatusPending) {
-				cs.Pending = n
+				cs.Pending, cs.NotYetDue = n, notDue
 			} else {
 				cs.Processing = n
 			}

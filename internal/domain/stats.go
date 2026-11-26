@@ -12,6 +12,7 @@ type ChannelStats struct {
 	// Right now.
 	QueueDepth map[Priority]int // IDs waiting in Redis
 	Pending    int              // waiting overall: in Redis, backing off, scheduled, or not yet dispatched
+	NotYetDue  int              // the part of Pending that may not be sent yet: scheduled for later or backing off before a retry
 	Processing int
 
 	// Over the window.

@@ -497,6 +497,7 @@ components:
           description: IDs waiting in Redis, per priority.
           additionalProperties: { type: integer }
         pending: { type: integer, description: "Waiting overall, including backlog in PostgreSQL." }
+        notYetDue: { type: integer, description: "Part of pending that may not be sent yet: scheduled for later, or backing off before a retry." }
         processing: { type: integer }
         sent: { type: integer }
         failed: { type: integer }

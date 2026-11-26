@@ -36,7 +36,7 @@ type Result struct {
 // Error is a failed delivery, classified so the worker can decide what to do.
 type Error struct {
 	StatusCode int           // 0 when no response arrived (timeout, connection error)
-	Retryable  bool          // 5xx, 429, timeouts and connection errors
+	Retryable  bool          // 5xx, 408, 429, timeouts and connection errors
 	RetryAfter time.Duration // from a Retry-After header, 0 if absent
 	Err        error
 }
@@ -109,7 +109,9 @@ func (h *HTTP) Send(ctx context.Context, m Message) (Result, error) {
 	case resp.StatusCode == http.StatusTooManyRequests:
 		return Result{}, &Error{StatusCode: resp.StatusCode, Retryable: true,
 			RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()), Err: errors.New("rate limited")}
-	case resp.StatusCode >= 500:
+	case resp.StatusCode >= 500, resp.StatusCode == http.StatusRequestTimeout:
+		// 408: the provider gave up waiting for the request; it says nothing
+		// about the message, so sending it again can work.
 		return Result{}, &Error{StatusCode: resp.StatusCode, Retryable: true, Err: errors.New(snippet(raw))}
 	default:
 		// Other 4xx: the request itself is wrong; sending it again will not help.

@@ -22,14 +22,18 @@ func TestStats(t *testing.T) {
 		finish(domain.StatusSent, 202, 100*time.Millisecond)
 	}
 	finish(domain.StatusFailed, 400, 300*time.Millisecond)
-	_, _, _ = repo.Create(ctx, newNotification(t, "", time.Now())) // still pending
+	_, _, _ = repo.Create(ctx, newNotification(t, "", time.Now())) // still pending, due now
+	later := newNotification(t, "", time.Now())
+	at := time.Now().Add(time.Hour)
+	later.ScheduledAt, later.NextAttemptAt = &at, at
+	_, _, _ = repo.Create(ctx, later) // pending, but scheduled for later
 
 	s, err := repo.Stats(ctx, 5*time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
 	sms := s.Channels[domain.ChannelSMS]
-	if sms.Pending != 1 || sms.Sent != 3 || sms.Failed != 1 || sms.AttemptsOK != 3 || sms.AttemptsFailed != 1 {
+	if sms.Pending != 2 || sms.NotYetDue != 1 || sms.Sent != 3 || sms.Failed != 1 || sms.AttemptsOK != 3 || sms.AttemptsFailed != 1 {
 		t.Fatalf("counts: %+v", sms)
 	}
 	if *sms.SuccessRate() != 0.75 || sms.ProviderP50 != 100*time.Millisecond || sms.EndToEndP50 <= 0 {

@@ -67,6 +67,7 @@ func TestClassifiesFailures(t *testing.T) {
 			w.Header().Set("Retry-After", "7")
 			w.WriteHeader(429)
 		}, 429, true, 7 * time.Second},
+		{"request timeout is retryable", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(408) }, 408, true, 0},
 		{"bad request is permanent", func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(400)
 			_, _ = w.Write([]byte(`{"error":"invalid number"}`))
